@@ -1,27 +1,14 @@
 import os
-import asyncio
 from flask import Flask, request, Response
-import edge_tts
+from gtts import gTTS
 import speech_recognition as sr
 import io
 
 app = Flask(__name__)
 
-# مائیکروسافٹ کی تمام اصل آوازیں
-VOICES = {
-    "ur": {
-        "female": "ur-PK-UzmaNeural",
-        "male": "ur-PK-AsadNeural"
-    },
-    "en": {
-        "female": "en-US-EmmaNeural",
-        "male": "en-US-BrianNeural"
-    }
-}
-
 @app.route('/')
 def home():
-    return "Luma Original Microsoft Voice Server is Running!"
+    return "Luma Voice Server (Google TTS) is Running!"
 
 # ─── مائیک کی آواز کو ٹیکسٹ میں بدلنے کا سسٹم (STT) ───
 @app.route('/stt', methods=['POST'])
@@ -69,56 +56,28 @@ def speech_to_text():
     except Exception as e:
         return f"STT Server Error: {str(e)}", 500
 
-# ─── مائیکروسافٹ ٹیکسٹ ٹو اسپیچ (Pitch & Speed Control کے ساتھ) ───
+# ─── گوگل ٹیکسٹ ٹو اسپیچ سسٹم (TTS) - جو کبھی بلاک نہیں ہوتا ───
 @app.route('/voice', methods=['GET'])
 def text_to_speech():
     user_text = request.args.get('text', '')
-    user_rate = request.args.get('rate', '-12%')
-    user_pitch = request.args.get('pitch', '0Hz')
-    user_lang = request.args.get('lang', 'ur')   
-    user_voice = request.args.get('voice', 'female') 
-
-    try:
-        selected_voice = VOICES[user_lang][user_voice]
-    except KeyError:
-        selected_voice = VOICES["ur"]["female"] 
-        
-    if not user_pitch.endswith('Hz'):
-        user_pitch = user_pitch + "Hz"
-        
-    if not user_pitch.startswith('-') and not user_pitch.startswith('+'):
-        user_pitch = "+" + user_pitch
-    if not user_rate.startswith('-') and not user_rate.startswith('+'):
-        user_rate = "+" + user_rate
+    user_lang = request.args.get('lang', 'ur')
 
     if not user_text:
         return "Error: No text provided", 400
 
     try:
-        async def generate():
-            # مائیکروسافٹ کنکشن کے لیے کمیونیکیٹر
-            communicate = edge_tts.Communicate(
-                text=user_text, 
-                voice=selected_voice, 
-                rate=user_rate, 
-                pitch=user_pitch
-            )
-            audio_stream_bytes = bytearray()
-            async for chunk in communicate.stream():
-                if chunk["type"] == "audio":
-                    audio_stream_bytes.extend(chunk["data"])
-            return bytes(audio_stream_bytes)
-
-        audio_output = asyncio.run(generate())
-
-        if not audio_output or len(audio_output) == 0:
-            return "Error: Edge TTS returned empty audio", 500
-
-        return Response(audio_output, mimetype="audio/mpeg")
+        # گوگل ٹی ٹی ایس ابجیکٹ بنانا
+        tts = gTTS(text=user_text, lang='ur' if user_lang == 'ur' else 'en', slow=False)
+        
+        audio_io = io.BytesIO()
+        tts.write_to_fp(audio_io)
+        audio_io.seek(0)
+        
+        return Response(audio_io.read(), mimetype="audio/mpeg")
         
     except Exception as e:
-        print(f"Microsoft TTS Error: {str(e)}")
-        return f"Microsoft TTS Error: {str(e)}", 500
+        print(f"TTS Error: {str(e)}")
+        return f"TTS Error: {str(e)}", 500
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
