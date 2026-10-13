@@ -8,13 +8,13 @@ import io
 
 app = Flask(__name__)
 
-# ─── پائپر ماڈل (خاتون کی اردو آواز - Female Urdu Voice) ───
-MODEL_ONNX = "ur_PK-medium.onnx"
-MODEL_JSON = "ur_PK-medium.onnx.json"
+# ─── فیمیل پائپر ماڈل (Urdu Female Voice: Aegis) ───
+MODEL_ONNX = "ur_PK-aegis_female-medium.onnx"
+MODEL_JSON = "ur_PK-aegis_female-medium.onnx.json"
 
-# HuggingFace کے 100% ورکنگ ڈائریکٹ لنکس
-ONNX_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/ur/ur_PK/medium/ur_PK-medium.onnx"
-JSON_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/ur/ur_PK/medium/ur_PK-medium.onnx.json"
+# فیمیل ماڈل کے 100% صحیح ڈائریکٹ لنکس
+ONNX_URL = "https://huggingface.co/mahwizzzz/piper-voice-ur-aegis-female/resolve/main/ur_PK-aegis_female-medium.onnx"
+JSON_URL = "https://huggingface.co/mahwizzzz/piper-voice-ur-aegis-female/resolve/main/ur_PK-aegis_female-medium.onnx.json"
 
 def download_file(url, target_path):
     req = urllib.request.Request(
@@ -27,24 +27,24 @@ def download_file(url, target_path):
 def download_model_if_missing():
     try:
         if not os.path.exists(MODEL_ONNX) or os.path.getsize(MODEL_ONNX) < 1000000:
-            print("Female Piper ONNX model downloading...")
+            print("Downloading Female Piper ONNX model (Aegis)...")
             download_file(ONNX_URL, MODEL_ONNX)
-            print("ONNX model downloaded successfully!")
+            print("Female ONNX model downloaded successfully!")
             
         if not os.path.exists(MODEL_JSON):
-            print("Female Piper JSON config downloading...")
+            print("Downloading Female Piper JSON config...")
             download_file(JSON_URL, MODEL_JSON)
             print("JSON config downloaded successfully!")
     except Exception as e:
         print(f"Model download error: {str(e)}")
 
-# سرور سٹارٹ ہوتے ہی ماڈل ڈاؤن لوڈ ہوگا
+# سرور سٹارٹ ہوتے ہی فیمیل ماڈل ڈاؤن لوڈ ہوگا
 download_model_if_missing()
 
 
 @app.route('/')
 def home():
-    return "Luma Hybrid Voice Server (Female Piper + Backup) is Running!"
+    return "Luma Hybrid Voice Server (Female Aegis Piper + Backup) is Running!"
 
 # ─── Speech To Text (STT) ───
 @app.route('/stt', methods=['POST'])
@@ -90,9 +90,10 @@ def speech_to_text():
     except sr.RequestError as e:
         return f"Google STT Service Error: {str(e)}", 500
     except Exception as e:
+        print(f"STT Server Error: {str(e)}")
         return f"STT Server Error: {str(e)}", 500
 
-# ─── Text To Speech (TTS) ───
+# ─── Text To Speech (TTS) Multi-language & Speed Control ───
 @app.route('/voice', methods=['GET'])
 def text_to_speech():
     user_text = request.args.get('text', '')
@@ -102,7 +103,7 @@ def text_to_speech():
     if not user_text:
         return "Error: No text provided", 400
 
-    # 1️⃣ Piper Female Voice (Urdu)
+    # 1️⃣ Female Piper Neural Voice (Urdu)
     if user_lang == 'ur':
         if not os.path.exists(MODEL_ONNX) or os.path.getsize(MODEL_ONNX) < 1000000:
             download_model_if_missing()
@@ -116,7 +117,7 @@ def text_to_speech():
                 if result.returncode == 0 and os.path.exists(output_wav) and os.path.getsize(output_wav) > 0:
                     with open(output_wav, "rb") as f:
                         audio_data = f.read()
-                    print(f"TTS Success: Female Piper TTS (Speed: {user_speed})")
+                    print(f"TTS Success: Female Aegis Piper TTS (Speed: {user_speed})")
                     return Response(audio_data, mimetype="audio/wav")
             except Exception as e:
                 print(f"Piper execution error: {str(e)}")
