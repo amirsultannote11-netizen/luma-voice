@@ -1,11 +1,34 @@
 import os
 import subprocess
+import urllib.request
 from flask import Flask, request, Response
 from gtts import gTTS
 import speech_recognition as sr
 import io
 
 app = Flask(__name__)
+
+# ─── پائپر ماڈل فائلیں خود بخود ڈاؤن لوڈ کرنے کا فنکشن ───
+MODEL_ONNX = "ur_PK-fasih-medium.onnx"
+MODEL_JSON = "ur_PK-fasih-medium.onnx.json"
+
+ONNX_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/main/ur/ur_PK/fasih/medium/ur_PK-fasih-medium.onnx"
+JSON_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/main/ur/ur_PK/fasih/medium/ur_PK-fasih-medium.onnx.json"
+
+def download_model_if_missing():
+    if not os.path.exists(MODEL_ONNX):
+        print("Piper ONNX model not found. Downloading from HuggingFace...")
+        urllib.request.urlretrieve(ONNX_URL, MODEL_ONNX)
+        print("ONNX model downloaded successfully!")
+        
+    if not os.path.exists(MODEL_JSON):
+        print("Piper JSON config not found. Downloading from HuggingFace...")
+        urllib.request.urlretrieve(JSON_URL, MODEL_JSON)
+        print("JSON config downloaded successfully!")
+
+# سرور شروع ہوتے ہی ماڈل چیک اور ڈاؤن لوڈ ہوگا
+download_model_if_missing()
+
 
 @app.route('/')
 def home():
@@ -69,9 +92,9 @@ def text_to_speech():
     # 1️⃣ کوشش کریں کہ پہلے Piper (نیورل آواز) سے آڈیو بنے
     try:
         output_wav = "output.wav"
-        model_path = "ur_PK-urd-medium.onnx"  # آپ کے فولڈر میں یہ ماڈل ہونا چاہیے
+        model_path = MODEL_ONNX
         
-        # Piper کمانড چلانا
+        # Piper کمانڈ چلانا
         cmd = f'echo "{user_text}" | piper --model {model_path} --output_file {output_wav}'
         result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
 
