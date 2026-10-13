@@ -12,29 +12,37 @@ app = Flask(__name__)
 MODEL_ONNX = "ur_PK-medium.onnx"
 MODEL_JSON = "ur_PK-medium.onnx.json"
 
+# صحیح اور ورکنگ HuggingFace لنکس
 ONNX_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/main/ur/ur_PK/medium/ur_PK-medium.onnx"
 JSON_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/main/ur/ur_PK/medium/ur_PK-medium.onnx.json"
 
 def download_model_if_missing():
-    if not os.path.exists(MODEL_ONNX):
-        print("Female Piper ONNX model downloading...")
-        urllib.request.urlretrieve(ONNX_URL, MODEL_ONNX)
-        print("ONNX model downloaded!")
-        
-    if not os.path.exists(MODEL_JSON):
-        print("Female Piper JSON config downloading...")
-        urllib.request.urlretrieve(JSON_URL, MODEL_JSON)
-        print("JSON config downloaded!")
+    try:
+        if not os.path.exists(MODEL_ONNX):
+            print("Female Piper ONNX model downloading...")
+            req = urllib.request.Request(ONNX_URL, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req) as response, open(MODEL_ONNX, 'wb') as out_file:
+                out_file.write(response.read())
+            print("ONNX model downloaded successfully!")
+            
+        if not os.path.exists(MODEL_JSON):
+            print("Female Piper JSON config downloading...")
+            req = urllib.request.Request(JSON_URL, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req) as response, open(MODEL_JSON, 'wb') as out_file:
+                out_file.write(response.read())
+            print("JSON config downloaded successfully!")
+    except Exception as e:
+        print(f"Model download warning (using fallback if needed): {str(e)}")
 
-# سرور سٹارٹ ہوتے ہی ماڈل چیک ہوگا
+# سرور سٹارٹ ہوتے ہی ماڈل چیک اور ڈاؤن لوڈ ہوگا
 download_model_if_missing()
 
 
 @app.route('/')
 def home():
-    return "Luma Hybrid Voice Server (Piper Urdu + English Backup) is Running!"
+    return "Luma Hybrid Voice Server (Female Piper + Multi-Language) is Running!"
 
-# ─── Speech To Text (STT) ───
+# ─── مائیک کی آواز کو ٹیکسٹ میں بدلنے کا سسٹم (STT) ───
 @app.route('/stt', methods=['POST'])
 def speech_to_text():
     try:
@@ -80,36 +88,36 @@ def speech_to_text():
     except Exception as e:
         return f"STT Server Error: {str(e)}", 500
 
-# ─── Text To Speech (TTS) multi-language & Speed Control ───
+# ─── ہائبرڈ TTS سسٹم: اسپیڈ اور زبان (Urdu/English) سلیکشن کے ساتھ ───
 @app.route('/voice', methods=['GET'])
 def text_to_speech():
     user_text = request.args.get('text', '')
-    user_lang = request.args.get('lang', 'ur').lower()  # 'ur' or 'en'
+    user_lang = request.args.get('lang', 'ur').lower()  # 'ur' یا 'en'
     user_speed = request.args.get('speed', '1.0')       # default speed 1.0
 
     if not user_text:
         return "Error: No text provided", 400
 
-    # 1️⃣ اگر اردو زبان سلیکٹ کی ہو تو پہلے Piper Neural Voice آزمائیں
-    if user_lang == 'ur':
+    # 1️⃣ اگر اردو سلیکٹ کی ہو اور ماڈل موجود ہو تو Piper استعمال کریں
+    if user_lang == 'ur' and os.path.exists(MODEL_ONNX):
         try:
             output_wav = "output.wav"
             model_path = MODEL_ONNX
             
-            # Piper speed adjustment using --length-scale
+            # Piper speed control using --length-scale
             cmd = f'echo "{user_text}" | piper --model {model_path} --length-scale {user_speed} --output_file {output_wav}'
             result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
 
             if result.returncode == 0 and os.path.exists(output_wav) and os.path.getsize(output_wav) > 0:
                 with open(output_wav, "rb") as f:
                     audio_data = f.read()
-                print(f"TTS Success: Urdu Piper TTS (Speed: {user_speed})")
+                print(f"TTS Success: Female Piper Urdu (Speed: {user_speed})")
                 return Response(audio_data, mimetype="audio/wav")
                 
         except Exception as e:
             print(f"Piper failed, switching to backup: {str(e)}")
 
-    # 2️⃣ اگر انگلش سلیکٹ ہو یا Piper اردو فیل ہو جائے تو Google gTTS استعمال کریں
+    # 2️⃣ اگر انگلش سلیکٹ ہو یا Piper فیل ہو تو Google gTTS استعمال ہوگا
     try:
         print(f"TTS Generating via Google gTTS (Lang: {user_lang})")
         tts_lang = 'en' if user_lang == 'en' else 'ur'
@@ -122,7 +130,7 @@ def text_to_speech():
         return Response(audio_io.read(), mimetype="audio/mpeg")
         
     except Exception as e:
-        print(f"TTS Generation failed: {str(e)}")
+        print(f"Both TTS failed: {str(e)}")
         return f"TTS Error: {str(e)}", 500
 
 if __name__ == '__main__':
