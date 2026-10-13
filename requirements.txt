@@ -1,4 +1,6 @@
-Flask
-gTTS
-SpeechRecognition
+flask
 gunicorn
+piper-tts
+gtts
+requests
+SpeechRecognition
