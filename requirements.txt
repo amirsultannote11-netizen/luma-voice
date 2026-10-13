@@ -1,5 +1,5 @@
 flask
-edge-tts>=6.1.3
+edge-tts
 gunicorn
 SpeechRecognition
 requests

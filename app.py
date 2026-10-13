@@ -23,28 +23,25 @@ VOICES = {
 def home():
     return "Luma Original Voice Server is Running!"
 
-# ─── مائیک کی آواز کو ٹیکسٹ میں بدلنے کا نیا سسٹم (STT) ───
+# ─── مائیک کی آواز کو ٹیکسٹ میں بدلنے کا سسٹم (STT) ───
 @app.route('/stt', methods=['POST'])
 def speech_to_text():
     try:
-        # ارڈوینو سے آنے والا خام آڈیو ڈیٹا (Raw Audio) پکڑنا
         audio_data = request.data
         if not audio_data:
             return "Error: No audio data received", 400
 
-        # ارڈوینو 16000Hz، 16-bit، Mono پر ڈیٹا بھیج رہا ہے، اس کو WAV فارمیٹ کی ہیڈر دینا
         wav_header = io.BytesIO()
         sample_rate = 16000
         bits_per_sample = 16
         channels = 1
         data_len = len(audio_data)
         
-        # WAV کا پورا ہیڈر بائٹس میں بنانا
         wav_header.write(b'RIFF')
         wav_header.write((data_len + 36).to_bytes(4, 'little'))
         wav_header.write(b'WAVEfmt ')
         wav_header.write((16).to_bytes(4, 'little'))
-        wav_header.write((1).to_bytes(2, 'little')) # PCM Linear
+        wav_header.write((1).to_bytes(2, 'little'))
         wav_header.write((channels).to_bytes(2, 'little'))
         wav_header.write((sample_rate).to_bytes(4, 'little'))
         wav_header.write((sample_rate * channels * bits_per_sample // 8).to_bytes(4, 'little'))
@@ -56,25 +53,23 @@ def speech_to_text():
         
         wav_header.seek(0)
 
-        # گوگل اسپیچ ریکگنیشن کے ذریعے آڈیو سے ٹیکسٹ نکالنا
         recognizer = sr.Recognizer()
         with sr.AudioFile(wav_header) as source:
             audio_file_data = recognizer.record(source)
             
-        # اردو زبان میں آواز کو پہچاننا (کیونکہ ہماری لوما اردو بولتی ہے)
         recognized_text = recognizer.recognize_google(audio_file_data, language="ur-PK")
         print(f"Server Recognized: {recognized_text}")
         
         return Response(recognized_text, mimetype="text/plain")
 
     except sr.UnknownValueError:
-        return "معذرت، آواز سمجھ نہیں آئی", 200 # اگر آواز صاف نہ ہو
+        return "معذرت، آواز سمجھ نہیں آئی", 200
     except sr.RequestError as e:
         return f"Google STT Service Error: {str(e)}", 500
     except Exception as e:
         return f"STT Server Error: {str(e)}", 500
 
-# ─── آپ کا پرانا والا ٹیکسٹ ٹو اسپیچ سسٹم (بالکل ویسا ہی ہے) ───
+# ─── جدید اور اپ ڈیٹڈ مائیکروسافٹ ٹیکسٹ ٹو اسپیچ سسٹم (TTS) ───
 @app.route('/voice', methods=['GET'])
 def text_to_speech():
     user_text = request.args.get('text', '')
@@ -107,20 +102,21 @@ def text_to_speech():
                 rate=user_rate, 
                 pitch=user_pitch
             )
-            audio_data = b""
+            audio_chunks = bytearray()
             async for chunk in communicate.stream():
                 if chunk["type"] == "audio":
-                    audio_data += chunk["data"]
-            return audio_data
+                    audio_chunks.extend(chunk["data"])
+            return bytes(audio_chunks)
 
         audio_stream = asyncio.run(generate())
 
-        if len(audio_stream) == 0:
+        if not audio_stream or len(audio_stream) == 0:
             return "Error: Edge TTS returned empty audio", 500
 
         return Response(audio_stream, mimetype="audio/mpeg")
         
     except Exception as e:
+        print(f"TTS Exception: {str(e)}")
         return f"Microsoft TTS Error: {str(e)}", 500
 
 if __name__ == '__main__':
