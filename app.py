@@ -1,4 +1,5 @@
 import os
+import subprocess
 from flask import Flask, request, Response
 from gtts import gTTS
 import speech_recognition as sr
@@ -8,7 +9,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Luma Voice Server (Google TTS) is Running!"
+    return "Luma Hybrid Voice Server (Piper + Google Backup) is Running!"
 
 # ─── مائیک کی آواز کو ٹیکسٹ میں بدلنے کا سسٹم (STT) ───
 @app.route('/stt', methods=['POST'])
@@ -56,7 +57,7 @@ def speech_to_text():
     except Exception as e:
         return f"STT Server Error: {str(e)}", 500
 
-# ─── گوگل ٹیکسٹ ٹو اسپیچ سسٹم (TTS) - جو کبھی بلاک نہیں ہوتا ───
+# ─── ہائبرڈ TTS سسٹم: پہلے Piper، اگر فیل ہو تو Google gTTS ───
 @app.route('/voice', methods=['GET'])
 def text_to_speech():
     user_text = request.args.get('text', '')
@@ -65,8 +66,27 @@ def text_to_speech():
     if not user_text:
         return "Error: No text provided", 400
 
+    # 1️⃣ کوشش کریں کہ پہلے Piper (نیورل آواز) سے آڈیو بنے
     try:
-        # گوگل ٹی ٹی ایس ابجیکٹ بنانا
+        output_wav = "output.wav"
+        model_path = "ur_PK-urd-medium.onnx"  # آپ کے فولڈر میں یہ ماڈل ہونا چاہیے
+        
+        # Piper کمانড چلانا
+        cmd = f'echo "{user_text}" | piper --model {model_path} --output_file {output_wav}'
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+
+        if result.returncode == 0 and os.path.exists(output_wav) and os.path.getsize(output_wav) > 0:
+            with open(output_wav, "rb") as f:
+                audio_data = f.read()
+            print("TTS Success: Generated using Piper TTS")
+            return Response(audio_data, mimetype="audio/wav")
+            
+    except Exception as e:
+        print(f"Piper failed, switching to Google backup: {str(e)}")
+
+    # 2️⃣ اگر Piper کام نہ کرے تو خود بخود Google gTTS پر شفٹ ہو جائیں (بیک اپ)
+    try:
+        print("TTS Fallback: Generating using Google gTTS")
         tts = gTTS(text=user_text, lang='ur' if user_lang == 'ur' else 'en', slow=False)
         
         audio_io = io.BytesIO()
@@ -76,7 +96,7 @@ def text_to_speech():
         return Response(audio_io.read(), mimetype="audio/mpeg")
         
     except Exception as e:
-        print(f"TTS Error: {str(e)}")
+        print(f"Both TTS failed: {str(e)}")
         return f"TTS Error: {str(e)}", 500
 
 if __name__ == '__main__':
