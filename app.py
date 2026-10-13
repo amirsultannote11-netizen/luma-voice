@@ -12,37 +12,41 @@ app = Flask(__name__)
 MODEL_ONNX = "ur_PK-medium.onnx"
 MODEL_JSON = "ur_PK-medium.onnx.json"
 
-# صحیح اور ورکنگ HuggingFace لنکس
-ONNX_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/main/ur/ur_PK/medium/ur_PK-medium.onnx"
-JSON_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/main/ur/ur_PK/medium/ur_PK-medium.onnx.json"
+# HuggingFace کے 100% ورکنگ ڈائریکٹ لنکس
+ONNX_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/ur/ur_PK/medium/ur_PK-medium.onnx"
+JSON_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/ur/ur_PK/medium/ur_PK-medium.onnx.json"
+
+def download_file(url, target_path):
+    req = urllib.request.Request(
+        url, 
+        headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+    )
+    with urllib.request.urlopen(req) as response, open(target_path, 'wb') as out_file:
+        out_file.write(response.read())
 
 def download_model_if_missing():
     try:
-        if not os.path.exists(MODEL_ONNX):
+        if not os.path.exists(MODEL_ONNX) or os.path.getsize(MODEL_ONNX) < 1000000:
             print("Female Piper ONNX model downloading...")
-            req = urllib.request.Request(ONNX_URL, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req) as response, open(MODEL_ONNX, 'wb') as out_file:
-                out_file.write(response.read())
+            download_file(ONNX_URL, MODEL_ONNX)
             print("ONNX model downloaded successfully!")
             
         if not os.path.exists(MODEL_JSON):
             print("Female Piper JSON config downloading...")
-            req = urllib.request.Request(JSON_URL, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req) as response, open(MODEL_JSON, 'wb') as out_file:
-                out_file.write(response.read())
+            download_file(JSON_URL, MODEL_JSON)
             print("JSON config downloaded successfully!")
     except Exception as e:
-        print(f"Model download warning (using fallback if needed): {str(e)}")
+        print(f"Model download error: {str(e)}")
 
-# سرور سٹارٹ ہوتے ہی ماڈل چیک اور ڈاؤن لوڈ ہوگا
+# سرور سٹارٹ ہوتے ہی ماڈل ڈاؤن لوڈ ہوگا
 download_model_if_missing()
 
 
 @app.route('/')
 def home():
-    return "Luma Hybrid Voice Server (Female Piper + Multi-Language) is Running!"
+    return "Luma Hybrid Voice Server (Female Piper + Backup) is Running!"
 
-# ─── مائیک کی آواز کو ٹیکسٹ میں بدلنے کا سسٹم (STT) ───
+# ─── Speech To Text (STT) ───
 @app.route('/stt', methods=['POST'])
 def speech_to_text():
     try:
@@ -88,38 +92,38 @@ def speech_to_text():
     except Exception as e:
         return f"STT Server Error: {str(e)}", 500
 
-# ─── ہائبرڈ TTS سسٹم: اسپیڈ اور زبان (Urdu/English) سلیکشن کے ساتھ ───
+# ─── Text To Speech (TTS) ───
 @app.route('/voice', methods=['GET'])
 def text_to_speech():
     user_text = request.args.get('text', '')
-    user_lang = request.args.get('lang', 'ur').lower()  # 'ur' یا 'en'
-    user_speed = request.args.get('speed', '1.0')       # default speed 1.0
+    user_lang = request.args.get('lang', 'ur').lower()
+    user_speed = request.args.get('speed', '1.0')
 
     if not user_text:
         return "Error: No text provided", 400
 
-    # 1️⃣ اگر اردو سلیکٹ کی ہو اور ماڈل موجود ہو تو Piper استعمال کریں
-    if user_lang == 'ur' and os.path.exists(MODEL_ONNX):
-        try:
-            output_wav = "output.wav"
-            model_path = MODEL_ONNX
-            
-            # Piper speed control using --length-scale
-            cmd = f'echo "{user_text}" | piper --model {model_path} --length-scale {user_speed} --output_file {output_wav}'
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    # 1️⃣ Piper Female Voice (Urdu)
+    if user_lang == 'ur':
+        if not os.path.exists(MODEL_ONNX) or os.path.getsize(MODEL_ONNX) < 1000000:
+            download_model_if_missing()
 
-            if result.returncode == 0 and os.path.exists(output_wav) and os.path.getsize(output_wav) > 0:
-                with open(output_wav, "rb") as f:
-                    audio_data = f.read()
-                print(f"TTS Success: Female Piper Urdu (Speed: {user_speed})")
-                return Response(audio_data, mimetype="audio/wav")
-                
-        except Exception as e:
-            print(f"Piper failed, switching to backup: {str(e)}")
+        if os.path.exists(MODEL_ONNX):
+            try:
+                output_wav = "output.wav"
+                cmd = f'echo "{user_text}" | piper --model {MODEL_ONNX} --length-scale {user_speed} --output_file {output_wav}'
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
 
-    # 2️⃣ اگر انگلش سلیکٹ ہو یا Piper فیل ہو تو Google gTTS استعمال ہوگا
+                if result.returncode == 0 and os.path.exists(output_wav) and os.path.getsize(output_wav) > 0:
+                    with open(output_wav, "rb") as f:
+                        audio_data = f.read()
+                    print(f"TTS Success: Female Piper TTS (Speed: {user_speed})")
+                    return Response(audio_data, mimetype="audio/wav")
+            except Exception as e:
+                print(f"Piper execution error: {str(e)}")
+
+    # 2️⃣ Google Backup Fallback
     try:
-        print(f"TTS Generating via Google gTTS (Lang: {user_lang})")
+        print(f"TTS Fallback: Google gTTS (Lang: {user_lang})")
         tts_lang = 'en' if user_lang == 'en' else 'ur'
         tts = gTTS(text=user_text, lang=tts_lang, slow=False)
         
