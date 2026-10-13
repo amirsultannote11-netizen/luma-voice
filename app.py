@@ -1,6 +1,6 @@
 import os
 import asyncio
-from flask import Flask, request, Response, jsonify
+from flask import Flask, request, Response
 import edge_tts
 import speech_recognition as sr
 import io
@@ -21,7 +21,7 @@ VOICES = {
 
 @app.route('/')
 def home():
-    return "Luma Original Voice Server is Running!"
+    return "Luma Original Microsoft Voice Server is Running!"
 
 # ─── مائیک کی آواز کو ٹیکسٹ میں بدلنے کا سسٹم (STT) ───
 @app.route('/stt', methods=['POST'])
@@ -69,7 +69,7 @@ def speech_to_text():
     except Exception as e:
         return f"STT Server Error: {str(e)}", 500
 
-# ─── جدید اور اپ ڈیٹڈ مائیکروسافٹ ٹیکسٹ ٹو اسپیچ سسٹم (TTS) ───
+# ─── مائیکروسافٹ ٹیکسٹ ٹو اسپیچ (Pitch & Speed Control کے ساتھ) ───
 @app.route('/voice', methods=['GET'])
 def text_to_speech():
     user_text = request.args.get('text', '')
@@ -96,27 +96,28 @@ def text_to_speech():
 
     try:
         async def generate():
+            # مائیکروسافٹ کنکشن کے لیے کمیونیکیٹر
             communicate = edge_tts.Communicate(
                 text=user_text, 
                 voice=selected_voice, 
                 rate=user_rate, 
                 pitch=user_pitch
             )
-            audio_chunks = bytearray()
+            audio_stream_bytes = bytearray()
             async for chunk in communicate.stream():
                 if chunk["type"] == "audio":
-                    audio_chunks.extend(chunk["data"])
-            return bytes(audio_chunks)
+                    audio_stream_bytes.extend(chunk["data"])
+            return bytes(audio_stream_bytes)
 
-        audio_stream = asyncio.run(generate())
+        audio_output = asyncio.run(generate())
 
-        if not audio_stream or len(audio_stream) == 0:
+        if not audio_output or len(audio_output) == 0:
             return "Error: Edge TTS returned empty audio", 500
 
-        return Response(audio_stream, mimetype="audio/mpeg")
+        return Response(audio_output, mimetype="audio/mpeg")
         
     except Exception as e:
-        print(f"TTS Exception: {str(e)}")
+        print(f"Microsoft TTS Error: {str(e)}")
         return f"Microsoft TTS Error: {str(e)}", 500
 
 if __name__ == '__main__':
