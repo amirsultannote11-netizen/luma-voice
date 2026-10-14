@@ -7,15 +7,13 @@ import speech_recognition as sr
 
 app = Flask(__name__)
 
-# کیش فولڈر
 CACHE_DIR = "/tmp/luma_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 @app.route('/')
 def home():
-    return "Luma Voice Server (Google TTS Simple Version) is Running!"
+    return "Luma Voice Server (gTTS Active) is Running Successfully!"
 
-# ─── 1. Speech to Text (STT) ───
 @app.route('/stt', methods=['POST'])
 def speech_to_text():
     try:
@@ -49,15 +47,11 @@ def speech_to_text():
             audio_file_data = recognizer.record(source)
 
         recognized_text = recognizer.recognize_google(audio_file_data, language="ur-PK")
-        print(f"Server Recognized: {recognized_text}")
         return Response(recognized_text, mimetype="text/plain")
 
-    except sr.UnknownValueError:
-        return "معذرت، آواز سمجھ نہیں آئی", 200
     except Exception as e:
         return f"STT Error: {str(e)}", 500
 
-# ─── 2. Google TTS (gTTS) ───
 @app.route('/voice', methods=['GET'])
 def text_to_speech():
     user_text = request.args.get('text', '')
@@ -66,7 +60,6 @@ def text_to_speech():
     if not user_text:
         return "Error: No text provided", 400
 
-    # کیش چیک کریں
     cache_key = hashlib.md5((user_text + user_lang).encode('utf-8')).hexdigest()
     cached_mp3 = os.path.join(CACHE_DIR, cache_key + ".mp3")
 
@@ -75,7 +68,6 @@ def text_to_speech():
             return Response(f.read(), mimetype="audio/mpeg")
 
     try:
-        # Google TTS سے آواز بنانا
         tts_lang = 'ur' if user_lang == 'ur' else 'en'
         tts = gTTS(text=user_text, lang=tts_lang, slow=False)
         
@@ -84,15 +76,12 @@ def text_to_speech():
         audio_io.seek(0)
         audio_bytes = audio_io.read()
 
-        # کیش میں محفوظ کریں
         with open(cached_mp3, "wb") as f:
             f.write(audio_bytes)
 
-        print(f"[gTTS] Audio sent for: {user_text[:20]}")
         return Response(audio_bytes, mimetype="audio/mpeg")
 
     except Exception as e:
-        print(f"gTTS Error: {str(e)}")
         return f"TTS Error: {str(e)}", 500
 
 if __name__ == '__main__':
