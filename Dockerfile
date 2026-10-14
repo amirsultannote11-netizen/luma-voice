@@ -1,0 +1,28 @@
+FROM python:3.10-slim
+
+# ضروری سسٹم پیکیجز انسٹال کریں
+RUN apt-get update && apt-get install -y \
+    wget \
+    curl \
+    git \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# لائبریریز انسٹال کریں
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# ─── Piper کی Urdu Female (Aegis) اور English Female وائس ماڈلز کی ڈاؤن لوڈنگ ───
+RUN wget -q https://huggingface.co/rhasspy/piper-voices/resolve/main/ur/ur_PK/aegis/medium/ur_PK-aegis-medium.onnx -O ur_PK-aegis_female-medium.onnx
+RUN wget -q https://huggingface.co/rhasspy/piper-voices/resolve/main/ur/ur_PK/aegis/medium/ur_PK-aegis-medium.onnx.json -O ur_PK-aegis_female-medium.onnx.json
+
+RUN wget -q https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx -O en_US-lessac-medium.onnx
+RUN wget -q https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json -O en_US-lessac-medium.onnx.json
+
+# تمام کوڈ کاپی کریں
+COPY . .
+
+EXPOSE 10000
+CMD ["python", "app.py"]
