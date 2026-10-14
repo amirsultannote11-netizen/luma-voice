@@ -1,4 +1,4 @@
 Flask
 gTTS
 SpeechRecognition
-gunicorn
+piper-tts
