@@ -3,35 +3,55 @@ import io
 import subprocess
 import tempfile
 import hashlib
+import wave
 from flask import Flask, request, Response
-from gtts import gTTS
 import speech_recognition as sr
+
+# ─── Piper Python API لوڈ کریں ───
+from piper.voice import PiperVoice
 
 app = Flask(__name__)
 
-# ─── کیش فولڈر بنائیں (تاکہ ایک ہی جملہ بار بار تیز بنے) ───
 CACHE_DIR = "/tmp/luma_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
+# ─── وائسز ایک بار لوڈ کریں ───
+urdu_voice = None
+english_voice = None
+
+def load_piper_voices():
+    global urdu_voice, english_voice
+    try:
+        if os.path.exists("ur_PK-aegis_female-medium.onnx"):
+            urdu_voice = PiperVoice.load("ur_PK-aegis_female-medium.onnx")
+            print("[STATUS] Urdu voice loaded")
+    except Exception as e:
+        print(f"[ERROR] Urdu voice: {e}")
+    try:
+        if os.path.exists("en_US-lessac-medium.onnx"):
+            english_voice = PiperVoice.load("en_US-lessac-medium.onnx")
+            print("[STATUS] English voice loaded")
+    except Exception as e:
+        print(f"[ERROR] English voice: {e}")
+
+load_piper_voices()
+
+
 @app.route('/')
 def home():
-    return "Luma Voice Server (Piper + Google TTS Backup) is Running!"
+    return "Luma Voice Server (Piper) is Running!"
 
 
-# ═══════════════════════════════════════════════════════════════
-# مائیک کی آواز کو ٹیکسٹ میں بدلنے کا سسٹم (STT)
-# ═══════════════════════════════════════════════════════════════
 @app.route('/stt', methods=['POST'])
 def speech_to_text():
     try:
         audio_data = request.data
         if not audio_data:
-            return "Error: No audio data received", 400
+            return "Error: No audio data", 400
 
-        # ESP32 سے آنے والے Raw Audio کا WAV ہیڈر بنائیں
         wav_header = io.BytesIO()
         sample_rate = 16000
-        bits_per_sample = 16
+        bits = 16
         channels = 1
         data_len = len(audio_data)
 
@@ -42,9 +62,9 @@ def speech_to_text():
         wav_header.write((1).to_bytes(2, 'little'))
         wav_header.write((channels).to_bytes(2, 'little'))
         wav_header.write((sample_rate).to_bytes(4, 'little'))
-        wav_header.write((sample_rate * channels * bits_per_sample // 8).to_bytes(4, 'little'))
-        wav_header.write((channels * bits_per_sample // 8).to_bytes(2, 'little'))
-        wav_header.write((bits_per_sample).to_bytes(2, 'little'))
+        wav_header.write((sample_rate * channels * bits // 8).to_bytes(4, 'little'))
+        wav_header.write((channels * bits // 8).to_bytes(2, 'little'))
+        wav_header.write((bits).to_bytes(2, 'little'))
         wav_header.write(b'data')
         wav_header.write((data_len).to_bytes(4, 'little'))
         wav_header.write(audio_data)
@@ -54,113 +74,76 @@ def speech_to_text():
         with sr.AudioFile(wav_header) as source:
             audio_file_data = recognizer.record(source)
 
-        # اردو میں آواز کو ٹیکسٹ میں بدلیں
-        recognized_text = recognizer.recognize_google(audio_file_data, language="ur-PK")
-        print(f"[STT] Recognized: {recognized_text}")
-        return Response(recognized_text, mimetype="text/plain")
+        try:
+            text = recognizer.recognize_google(audio_file_data, language="ur-PK")
+        except sr.UnknownValueError:
+            wav_header.seek(0)
+            with sr.AudioFile(wav_header) as source:
+                audio_file_data = recognizer.record(source)
+            text = recognizer.recognize_google(audio_file_data, language="en-US")
+
+        print(f"[STT] {text}")
+        return Response(text, mimetype="text/plain")
 
     except sr.UnknownValueError:
         return "معذرت، آواز سمجھ نہیں آئی", 200
-    except sr.RequestError as e:
-        return f"Google STT Service Error: {str(e)}", 500
     except Exception as e:
-        print(f"[STT ERROR] {str(e)}")
-        return f"STT Server Error: {str(e)}", 500
+        print(f"[STT ERROR] {e}")
+        return f"STT Error: {e}", 500
 
 
-# ═══════════════════════════════════════════════════════════════
-# TTS سسٹم: Piper (تیز MP3) + gTTS بیک اپ
-# ═══════════════════════════════════════════════════════════════
 @app.route('/voice', methods=['GET'])
 def text_to_speech():
     user_text = request.args.get('text', '')
     user_lang = request.args.get('lang', 'ur')
 
     if not user_text:
-        return "Error: No text provided", 400
+        return "Error: No text", 400
 
-    # ─── کیش چیک کریں: اگر یہی جملہ پہلے بنا ہوا ہے تو فوراً بھیج دیں ───
     cache_key = hashlib.md5((user_text + user_lang).encode('utf-8')).hexdigest()
     cached_mp3 = os.path.join(CACHE_DIR, cache_key + ".mp3")
 
     if os.path.exists(cached_mp3) and os.path.getsize(cached_mp3) > 0:
-        print(f"[CACHE HIT] Sending cached MP3 for: {user_text[:30]}")
+        print(f"[CACHE] {user_text[:30]}")
         with open(cached_mp3, "rb") as f:
             return Response(f.read(), mimetype="audio/mpeg")
 
-    # ─── 1. Piper TTS کے ذریعے WAV بنائیں ───
+    voice = urdu_voice if user_lang == 'ur' else english_voice
+    if voice is None:
+        return "Voice not loaded", 500
+
+    wav_path = tempfile.mktemp(suffix=".wav")
+    mp3_path = tempfile.mktemp(suffix=".mp3")
+
     try:
-        model_name = "ur_PK-aegis_female-medium.onnx" if user_lang == 'ur' else "en_US-lessac-medium.onnx"
+        with wave.open(wav_path, "wb") as wav_file:
+            voice.synthesize(user_text, wav_file)
 
-        if os.path.exists(model_name):
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as wav_file:
-                wav_path = wav_file.name
+        ffmpeg_result = subprocess.run(
+            ["ffmpeg", "-y", "-i", wav_path, "-b:a", "32k", "-ar", "16000", "-ac", "1", mp3_path],
+            capture_output=True, timeout=30
+        )
 
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as mp3_file:
-                mp3_path = mp3_file.name
+        if os.path.exists(wav_path):
+            os.remove(wav_path)
 
-            # Piper کو چلائیں (اردو ٹیکسٹ صحیح طریقے سے بھیجنے کے لیے)
-            try:
-                piper_process = subprocess.run(
-                    ["piper", "--model", model_name, "--output_file", wav_path],
-                    input=user_text.encode('utf-8'),
-                    capture_output=True,
-                    timeout=30
-                )
-                print(f"[PIPER] Return code: {piper_process.returncode}")
+        if ffmpeg_result.returncode == 0 and os.path.getsize(mp3_path) > 0:
+            with open(mp3_path, "rb") as f:
+                audio_bytes = f.read()
 
-                if piper_process.returncode == 0 and os.path.exists(wav_path) and os.path.getsize(wav_path) > 0:
-                    # WAV کو MP3 میں کنورٹ کریں (سائز 4 گنا کم ہو جائے گا)
-                    ffmpeg_result = subprocess.run(
-                        ["ffmpeg", "-y", "-i", wav_path, "-b:a", "32k", "-ar", "16000", "-ac", "1", mp3_path],
-                        capture_output=True,
-                        timeout=30
-                    )
+            with open(cached_mp3, "wb") as f:
+                f.write(audio_bytes)
 
-                    if os.path.exists(wav_path):
-                        os.remove(wav_path)
-
-                    if ffmpeg_result.returncode == 0 and os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 0:
-                        with open(mp3_path, "rb") as f:
-                            audio_bytes = f.read()
-
-                        # کیش میں محفوظ کریں
-                        with open(cached_mp3, "wb") as f:
-                            f.write(audio_bytes)
-
-                        os.remove(mp3_path)
-                        print(f"[PIPER] MP3 sent, size: {len(audio_bytes)} bytes")
-                        return Response(audio_bytes, mimetype="audio/mpeg")
-                    else:
-                        print(f"[FFMPEG ERROR] {ffmpeg_result.stderr.decode()[:200]}")
-                else:
-                    print(f"[PIPER ERROR] {piper_process.stderr.decode()[:200]}")
-            except subprocess.TimeoutExpired:
-                print("[PIPER] Timeout! Server is too slow.")
-            except FileNotFoundError as fnf:
-                print(f"[PIPER NOT FOUND] {str(fnf)}")
-
-    except Exception as piper_err:
-        print(f"Piper TTS Error (Falling back to gTTS): {str(piper_err)}")
-
-    # ─── 2. اگر Piper فیل ہو تو gTTS بیک اپ استعمال کریں ───
-    try:
-        tts = gTTS(text=user_text, lang='ur' if user_lang == 'ur' else 'en', slow=False)
-        audio_io = io.BytesIO()
-        tts.write_to_fp(audio_io)
-        audio_io.seek(0)
-        audio_bytes = audio_io.read()
-
-        # کیش میں محفوظ کریں
-        with open(cached_mp3, "wb") as f:
-            f.write(audio_bytes)
-
-        print(f"[gTTS] MP3 sent, size: {len(audio_bytes)} bytes")
-        return Response(audio_bytes, mimetype="audio/mpeg")
+            os.remove(mp3_path)
+            print(f"[PIPER] MP3 sent: {len(audio_bytes)} bytes")
+            return Response(audio_bytes, mimetype="audio/mpeg")
+        else:
+            print(f"[FFMPEG ERROR] {ffmpeg_result.stderr.decode()[:300]}")
+            return "FFmpeg failed", 500
 
     except Exception as e:
-        print(f"TTS Backup Error: {str(e)}")
-        return f"TTS Error: {str(e)}", 500
+        print(f"[PIPER ERROR] {e}")
+        return f"Piper Error: {e}", 500
 
 
 if __name__ == '__main__':
