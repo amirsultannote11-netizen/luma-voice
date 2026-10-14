@@ -3,12 +3,14 @@ from flask import Flask, request, Response
 from gtts import gTTS
 import speech_recognition as sr
 import io
+import subprocess
+import tempfile
 
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Luma Voice Server (Google TTS) is Running!"
+    return "Luma Voice Server (Piper + Google TTS Backup) is Running!"
 
 # ─── مائیک کی آواز کو ٹیکسٹ میں بدلنے کا سسٹم (STT) ───
 @app.route('/stt', methods=['POST'])
@@ -56,7 +58,7 @@ def speech_to_text():
     except Exception as e:
         return f"STT Server Error: {str(e)}", 500
 
-# ─── گوگل ٹیکسٹ ٹو اسپیچ سسٹم (TTS) - جو کبھی بلاک نہیں ہوتا ───
+# ─── Piper TTS اور Google TTS بیک اپ سسٹم ───
 @app.route('/voice', methods=['GET'])
 def text_to_speech():
     user_text = request.args.get('text', '')
@@ -65,18 +67,35 @@ def text_to_speech():
     if not user_text:
         return "Error: No text provided", 400
 
+    # 1. پہلے Piper TTS کے ذریعے خاتون کی خوبصورت آواز بنانے کی کوشش کریں
     try:
-        # گوگل ٹی ٹی ایس ابجیکٹ بنانا
-        tts = gTTS(text=user_text, lang='ur' if user_lang == 'ur' else 'en', slow=False)
+        model_name = "ur_PK-aegis_female-medium.onnx" if user_lang == 'ur' else "en_US-lessac-medium.onnx"
         
+        if os.path.exists(model_name):
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as wav_file:
+                wav_path = wav_file.name
+
+            cmd = f"echo '{user_text}' | piper --model {model_name} --output_file {wav_path}"
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+
+            if result.returncode == 0 and os.path.exists(wav_path) and os.path.getsize(wav_path) > 0:
+                with open(wav_path, "rb") as f:
+                    audio_bytes = f.read()
+                os.remove(wav_path)
+                return Response(audio_bytes, mimetype="audio/wav")
+    except Exception as piper_err:
+        print(f"Piper TTS Error (Falling back to gTTS): {str(piper_err)}")
+
+    # 2. اگر Piper میں کوئی مسئلہ ہو تو گوگل gTTS بطورِ بیک اپ استعمال ہوگا
+    try:
+        tts = gTTS(text=user_text, lang='ur' if user_lang == 'ur' else 'en', slow=False)
         audio_io = io.BytesIO()
         tts.write_to_fp(audio_io)
         audio_io.seek(0)
-        
         return Response(audio_io.read(), mimetype="audio/mpeg")
         
     except Exception as e:
-        print(f"TTS Error: {str(e)}")
+        print(f"TTS Backup Error: {str(e)}")
         return f"TTS Error: {str(e)}", 500
 
 if __name__ == '__main__':
