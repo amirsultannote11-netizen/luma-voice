@@ -1,12 +1,14 @@
 FROM python:3.10-slim
 
-# ─── ضروری سسٹم پیکجز انسٹال کریں (ffmpeg سمیت) ───
+# ─── ضروری سسٹم پیکجز (espeak-ng سمیت) ───
 RUN apt-get update && apt-get install -y \
     wget \
     curl \
     git \
     build-essential \
     ffmpeg \
+    espeak-ng \
+    libespeak-ng1 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -15,8 +17,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ─── Piper TTS انجن انسٹال کریں ───
-RUN pip install piper-tts
+# ─── Piper TTS انجن انسٹال کریں اور تصدیق کریں ───
+RUN pip install --no-cache-dir piper-tts && \
+    python -c "import piper; print('[STATUS] Piper installed successfully')"
 
 # ─── Piper Urdu (Aegis Female) وائس ڈاؤن لوڈ کریں ───
 RUN wget --tries=5 --timeout=60 -q "https://huggingface.co/rhasspy/piper-voices/resolve/main/ur/ur_PK/aegis_female/medium/ur_PK-aegis_female-medium.onnx" -O ur_PK-aegis_female-medium.onnx
