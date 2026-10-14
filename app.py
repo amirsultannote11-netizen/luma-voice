@@ -8,13 +8,17 @@ import io
 
 app = Flask(__name__)
 
-# ─── فیمیل پائپر ماڈل (Urdu Female Voice: Aegis) ───
-MODEL_ONNX = "ur_PK-aegis_female-medium.onnx"
-MODEL_JSON = "ur_PK-aegis_female-medium.onnx.json"
+# ─── 1. اردو فیمیل ماڈل (Urdu Female: Aegis) ───
+URDU_MODEL_ONNX = "ur_PK-aegis_female-medium.onnx"
+URDU_MODEL_JSON = "ur_PK-aegis_female-medium.onnx.json"
+URDU_ONNX_URL = "https://huggingface.co/mahwizzzz/piper-voice-ur-aegis-female/resolve/main/ur_PK-aegis_female-medium.onnx"
+URDU_JSON_URL = "https://huggingface.co/mahwizzzz/piper-voice-ur-aegis-female/resolve/main/ur_PK-aegis_female-medium.onnx.json"
 
-# فیمیل ماڈل کے 100% صحیح ڈائریکٹ لنکس
-ONNX_URL = "https://huggingface.co/mahwizzzz/piper-voice-ur-aegis-female/resolve/main/ur_PK-aegis_female-medium.onnx"
-JSON_URL = "https://huggingface.co/mahwizzzz/piper-voice-ur-aegis-female/resolve/main/ur_PK-aegis_female-medium.onnx.json"
+# ─── 2. انگلش فیمیل ماڈل (English Female: Amy) ───
+ENG_MODEL_ONNX = "en_US-amy-medium.onnx"
+ENG_MODEL_JSON = "en_US-amy-medium.onnx.json"
+ENG_ONNX_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium/en_US-amy-medium.onnx"
+ENG_JSON_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium/en_US-amy-medium.onnx.json"
 
 def download_file(url, target_path):
     req = urllib.request.Request(
@@ -24,27 +28,28 @@ def download_file(url, target_path):
     with urllib.request.urlopen(req) as response, open(target_path, 'wb') as out_file:
         out_file.write(response.read())
 
-def download_model_if_missing():
+def download_models_if_missing():
     try:
-        if not os.path.exists(MODEL_ONNX) or os.path.getsize(MODEL_ONNX) < 1000000:
-            print("Downloading Female Piper ONNX model (Aegis)...")
-            download_file(ONNX_URL, MODEL_ONNX)
-            print("Female ONNX model downloaded successfully!")
-            
-        if not os.path.exists(MODEL_JSON):
-            print("Downloading Female Piper JSON config...")
-            download_file(JSON_URL, MODEL_JSON)
-            print("JSON config downloaded successfully!")
+        if not os.path.exists(URDU_MODEL_ONNX) or os.path.getsize(URDU_MODEL_ONNX) < 1000000:
+            print("Downloading Female Urdu Piper Model (Aegis)...")
+            download_file(URDU_ONNX_URL, URDU_MODEL_ONNX)
+            download_file(URDU_JSON_URL, URDU_MODEL_JSON)
+            print("Urdu Female Model Downloaded!")
+
+        if not os.path.exists(ENG_MODEL_ONNX) or os.path.getsize(ENG_MODEL_ONNX) < 1000000:
+            print("Downloading Female English Piper Model (Amy)...")
+            download_file(ENG_ONNX_URL, ENG_MODEL_ONNX)
+            download_file(ENG_JSON_URL, ENG_MODEL_JSON)
+            print("English Female Model Downloaded!")
+
     except Exception as e:
-        print(f"Model download error: {str(e)}")
+        print(f"Model Download Warning: {str(e)}")
 
-# سرور سٹارٹ ہوتے ہی فیمیل ماڈل ڈاؤن لوڈ ہوگا
-download_model_if_missing()
-
+download_models_if_missing()
 
 @app.route('/')
 def home():
-    return "Luma Hybrid Voice Server (Female Aegis Piper + Backup) is Running!"
+    return "Luma Hybrid Server (Urdu & English Female Piper + Google Backup) is Running!"
 
 # ─── Speech To Text (STT) ───
 @app.route('/stt', methods=['POST'])
@@ -90,10 +95,9 @@ def speech_to_text():
     except sr.RequestError as e:
         return f"Google STT Service Error: {str(e)}", 500
     except Exception as e:
-        print(f"STT Server Error: {str(e)}")
         return f"STT Server Error: {str(e)}", 500
 
-# ─── Text To Speech (TTS) Multi-language & Speed Control ───
+# ─── Text To Speech (TTS) ───
 @app.route('/voice', methods=['GET'])
 def text_to_speech():
     user_text = request.args.get('text', '')
@@ -103,26 +107,37 @@ def text_to_speech():
     if not user_text:
         return "Error: No text provided", 400
 
-    # 1️⃣ Female Piper Neural Voice (Urdu)
-    if user_lang == 'ur':
-        if not os.path.exists(MODEL_ONNX) or os.path.getsize(MODEL_ONNX) < 1000000:
-            download_model_if_missing()
+    selected_model = ENG_MODEL_ONNX if user_lang == 'en' else URDU_MODEL_ONNX
 
-        if os.path.exists(MODEL_ONNX):
-            try:
-                output_wav = "output.wav"
-                cmd = f'echo "{user_text}" | piper --model {MODEL_ONNX} --length-scale {user_speed} --output_file {output_wav}'
-                result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    if not os.path.exists(selected_model):
+        download_models_if_missing()
 
-                if result.returncode == 0 and os.path.exists(output_wav) and os.path.getsize(output_wav) > 0:
-                    with open(output_wav, "rb") as f:
-                        audio_data = f.read()
-                    print(f"TTS Success: Female Aegis Piper TTS (Speed: {user_speed})")
-                    return Response(audio_data, mimetype="audio/wav")
-            except Exception as e:
-                print(f"Piper execution error: {str(e)}")
+    output_wav = "output_raw.wav"
+    converted_wav = "output_esp32.wav"
 
-    # 2️⃣ Google Backup Fallback
+    if os.path.exists(selected_model):
+        try:
+            # Piper TTS ایگزیکیوشن
+            cmd = f'echo "{user_text}" | piper --model {selected_model} --length-scale {user_speed} --output_file {output_wav}'
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+
+            if result.returncode == 0 and os.path.exists(output_wav) and os.path.getsize(output_wav) > 0:
+                # FFmpeg کے ذریعے آڈیو کو ESP32 دوست 16kHz PCM WAV میں کنورٹ کرنا
+                ffmpeg_cmd = f'ffmpeg -y -i {output_wav} -ar 16000 -ac 1 -c:a pcm_s16le -f wav {converted_wav}'
+                ff_res = subprocess.run(ffmpeg_cmd, shell=True, capture_output=True, text=True)
+
+                target_file = converted_wav if (ff_res.returncode == 0 and os.path.exists(converted_wav)) else output_wav
+
+                with open(target_file, "rb") as f:
+                    audio_data = f.read()
+                
+                print(f"TTS Success: Piper Female Model ({user_lang.upper()}, Speed: {user_speed})")
+                return Response(audio_data, mimetype="audio/wav")
+
+        except Exception as e:
+            print(f"Piper error, falling back to Google: {str(e)}")
+
+    # 2️⃣ گوگل بیک اپ (gTTS)
     try:
         print(f"TTS Fallback: Google gTTS (Lang: {user_lang})")
         tts_lang = 'en' if user_lang == 'en' else 'ur'
