@@ -7,24 +7,24 @@ from gtts import gTTS
 
 app = Flask(__name__)
 
-# Piper Model Files
+# Model and Config filenames
 MODEL_FILENAME = "ur_PK-aegis_female-medium.onnx"
 CONFIG_FILENAME = "ur_PK-aegis_female-medium.onnx.json"
 
-# Working Direct URLs for Urdu Female Voice
-MODEL_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/ur/ur_PK/aegis/medium/ur_PK-aegis_female-medium.onnx"
-CONFIG_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/ur/ur_PK/aegis/medium/ur_PK-aegis_female-medium.onnx.json"
+# Exact Direct URLs from Hugging Face Repository
+MODEL_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/main/ur/ur_PK/aegis_female/medium/ur_PK-aegis_female-medium.onnx"
+CONFIG_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/main/ur/ur_PK/aegis_female/medium/ur_PK-aegis_female-medium.onnx.json"
 
 def download_file_if_missing(filename, url):
     if not os.path.exists(filename):
-        print(f"Downloading {filename}...")
+        print(f"Downloading {filename} from Hugging Face...")
         urllib.request.urlretrieve(url, filename)
         print(f"Downloaded {filename} successfully!")
 
 piper_voice = None
 
 try:
-    # Auto-download working model & json
+    # Auto download on startup
     download_file_if_missing(MODEL_FILENAME, MODEL_URL)
     download_file_if_missing(CONFIG_FILENAME, CONFIG_URL)
 
