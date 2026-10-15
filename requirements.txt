@@ -1,5 +1,5 @@
-Flask
-SpeechRecognition
-gTTS
+flask
+gunicorn
 piper-tts
-onnxruntime
+gTTS
+lameenc
