@@ -11,20 +11,19 @@ app = Flask(__name__)
 MODEL_FILENAME = "ur_PK-aegis_female-medium.onnx"
 CONFIG_FILENAME = "ur_PK-aegis_female-medium.onnx.json"
 
-# Exact Direct URLs from Hugging Face Repository
+# Direct URLs
 MODEL_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/main/ur/ur_PK/aegis_female/medium/ur_PK-aegis_female-medium.onnx"
 CONFIG_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/main/ur/ur_PK/aegis_female/medium/ur_PK-aegis_female-medium.onnx.json"
 
 def download_file_if_missing(filename, url):
     if not os.path.exists(filename):
-        print(f"Downloading {filename} from Hugging Face...")
+        print(f"Downloading {filename}...")
         urllib.request.urlretrieve(url, filename)
         print(f"Downloaded {filename} successfully!")
 
 piper_voice = None
 
 try:
-    # Auto download on startup
     download_file_if_missing(MODEL_FILENAME, MODEL_URL)
     download_file_if_missing(CONFIG_FILENAME, CONFIG_URL)
 
@@ -49,7 +48,17 @@ def text_to_speech():
         try:
             wav_io = io.BytesIO()
             piper_voice.synthesize(user_text, wav_io)
-            return Response(wav_io.getvalue(), mimetype="audio/wav")
+            audio_data = wav_io.getvalue()
+            
+            # Sending audio with explicit Content-Length for ESP32
+            return Response(
+                audio_data,
+                mimetype="audio/wav",
+                headers={
+                    "Content-Length": str(len(audio_data)),
+                    "Accept-Ranges": "bytes"
+                }
+            )
         except Exception as e:
             print(f"Piper Synthesis Error: {e}")
 
@@ -59,7 +68,17 @@ def text_to_speech():
         tts = gTTS(text=user_text, lang='ur', slow=False)
         mp3_io = io.BytesIO()
         tts.write_to_fp(mp3_io)
-        return Response(mp3_io.getvalue(), mimetype="audio/mpeg")
+        audio_data = mp3_io.getvalue()
+        
+        # Sending audio with explicit Content-Length for ESP32
+        return Response(
+            audio_data,
+            mimetype="audio/mpeg",
+            headers={
+                "Content-Length": str(len(audio_data)),
+                "Accept-Ranges": "bytes"
+            }
+        )
     except Exception as e:
         return f"Error: {e}", 500
 
