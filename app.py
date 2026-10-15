@@ -1,7 +1,9 @@
 import os
 import io
 import re
+import time
 import json
+import threading
 import wave
 import uuid
 import logging
@@ -216,8 +218,67 @@ def health():
     })
 
 
+# Finished MP3 files wait here for a few minutes so the ESP32 can fetch
+# them with a short URL (no more giant Urdu URLs).
+AUDIO_CACHE = {}
+AUDIO_CACHE_LOCK = threading.Lock()
+AUDIO_TTL_SECONDS = 600
+AUDIO_CACHE_MAX_ITEMS = 12
+
+
+def cache_put(audio, engine):
+    audio_id = uuid.uuid4().hex[:16]
+    now = time.time()
+    with AUDIO_CACHE_LOCK:
+        for key in [k for k, v in AUDIO_CACHE.items() if now - v["t"] > AUDIO_TTL_SECONDS]:
+            del AUDIO_CACHE[key]
+        while len(AUDIO_CACHE) >= AUDIO_CACHE_MAX_ITEMS:
+            oldest = min(AUDIO_CACHE, key=lambda k: AUDIO_CACHE[k]["t"])
+            del AUDIO_CACHE[oldest]
+        AUDIO_CACHE[audio_id] = {"audio": audio, "engine": engine, "t": now}
+    return audio_id
+
+
+def cache_get(audio_id):
+    with AUDIO_CACHE_LOCK:
+        item = AUDIO_CACHE.get(audio_id)
+        return (item["audio"], item["engine"]) if item else None
+
+
+def synthesize(text, lang, length_scale, pitch_factor):
+    """Returns (mp3_bytes, engine_name). Piper first, Google as backup."""
+    # English text: Urdu Piper voice cannot read it well, so use Google.
+    if lang == "en":
+        try:
+            audio = generate_google_mp3(text, "en")
+            logger.info("GOOGLE EN SUCCESS: %d bytes", len(audio))
+            return audio, "google-en"
+        except Exception:
+            logger.exception("GOOGLE EN FAILED")
+
+    # Urdu: Piper first (converted to MP3).
+    elif piper_voice is not None:
+        try:
+            audio = wav_to_mp3(generate_piper_wav(text, length_scale), pitch_factor)
+            logger.info(
+                "PIPER MP3 SUCCESS: %d bytes (length_scale=%.2f pitch_factor=%.2f)",
+                len(audio), length_scale, pitch_factor,
+            )
+            return audio, "piper-mp3"
+        except Exception:
+            logger.exception("PIPER SYNTHESIS FAILED")
+    else:
+        logger.error("Piper unavailable; trying Google TTS")
+
+    # Fallback: Google Urdu.
+    audio = generate_google_mp3(text, "ur")
+    logger.info("GOOGLE TTS SUCCESS: %d bytes", len(audio))
+    return audio, "google"
+
+
 @app.route("/voice", methods=["GET", "POST"])
 def voice():
+    """Old style: text inside the URL. Still works for short text."""
     if request.method == "POST":
         text = request.form.get("text", "")
         if not text and request.is_json:
@@ -241,40 +302,51 @@ def voice():
     if len(text) > 2000:
         return jsonify({"error": "Text too long"}), 413
 
-    # English text: Urdu Piper voice cannot read it well, so use Google.
-    if lang == "en":
-        try:
-            audio = generate_google_mp3(text, "en")
-            logger.info("GOOGLE EN SUCCESS: %d bytes", len(audio))
-            return mp3_response(audio, "google-en")
-        except Exception:
-            logger.exception("GOOGLE EN FAILED")
-
-    # Urdu: Piper first (converted to MP3).
-    elif piper_voice is not None:
-        try:
-            audio = wav_to_mp3(generate_piper_wav(text, length_scale), pitch_factor)
-            logger.info(
-                "PIPER MP3 SUCCESS: %d bytes (rate=%s%% pitch=%sHz length_scale=%.2f)",
-                len(audio), rate_pct, pitch_hz, length_scale,
-            )
-            return mp3_response(audio, "piper-mp3")
-        except Exception:
-            logger.exception("PIPER SYNTHESIS FAILED")
-    else:
-        logger.error("Piper unavailable; trying Google TTS")
-
-    # Fallback: Google Urdu.
     try:
-        audio = generate_google_mp3(text, "ur")
-        logger.info("GOOGLE TTS SUCCESS: %d bytes", len(audio))
-        return mp3_response(audio, "google")
+        audio, engine = synthesize(text, lang, length_scale, pitch_factor)
+        return mp3_response(audio, engine)
     except Exception:
-        logger.exception("GOOGLE TTS ALSO FAILED")
+        logger.exception("ALL TTS ENGINES FAILED")
         return jsonify({
             "error": "Both TTS engines failed",
             "details": "Check Render logs",
         }), 500
+
+
+@app.route("/tts", methods=["POST"])
+def tts():
+    """New style: ESP32 POSTs the text (any length). We build ONE MP3,
+    keep it for a few minutes and answer with a short id."""
+    text = request.get_data(as_text=True).strip()
+    lang = request.args.get("lang", "ur").strip().lower()
+    rate_pct, pitch_hz, length_scale, pitch_factor = voice_params()
+
+    if not text:
+        return Response("", status=400, mimetype="text/plain")
+    if len(text) > 2000:
+        return Response("", status=413, mimetype="text/plain")
+
+    try:
+        audio, engine = synthesize(text, lang, length_scale, pitch_factor)
+    except Exception:
+        logger.exception("ALL TTS ENGINES FAILED")
+        return Response("", status=500, mimetype="text/plain")
+
+    audio_id = cache_put(audio, engine)
+    logger.info(
+        "TTS READY id=%s engine=%s bytes=%d (rate=%s%% pitch=%sHz)",
+        audio_id, engine, len(audio), rate_pct, pitch_hz,
+    )
+    return Response(audio_id, status=200, mimetype="text/plain")
+
+
+@app.route("/audio/<audio_id>.mp3", methods=["GET"])
+def audio_file(audio_id):
+    found = cache_get(audio_id)
+    if not found:
+        return Response("Audio expired or not found", status=404, mimetype="text/plain")
+    audio, engine = found
+    return mp3_response(audio, engine)
 
 
 def pcm_to_wav(pcm, sample_rate=16000):
