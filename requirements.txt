@@ -1,4 +1,0 @@
-Flask
-SpeechRecognition
-gTTS
-piper-tts
