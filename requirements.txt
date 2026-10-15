@@ -3,3 +3,4 @@ gunicorn
 piper-tts
 gTTS
 lameenc
+numpy
