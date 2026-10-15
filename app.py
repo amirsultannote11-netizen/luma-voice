@@ -7,12 +7,13 @@ from gtts import gTTS
 
 app = Flask(__name__)
 
-# Piper Model URLs & Local Paths
+# Piper Model Files
 MODEL_FILENAME = "ur_PK-aegis_female-medium.onnx"
 CONFIG_FILENAME = "ur_PK-aegis_female-medium.onnx.json"
 
-MODEL_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/main/ur/ur_PK/aegis/medium/ur_PK-aegis_female-medium.onnx"
-CONFIG_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/main/ur/ur_PK/aegis/medium/ur_PK-aegis_female-medium.onnx.json"
+# Working Direct URLs for Urdu Female Voice
+MODEL_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/ur/ur_PK/aegis/medium/ur_PK-aegis_female-medium.onnx"
+CONFIG_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/ur/ur_PK/aegis/medium/ur_PK-aegis_female-medium.onnx.json"
 
 def download_file_if_missing(filename, url):
     if not os.path.exists(filename):
@@ -23,7 +24,7 @@ def download_file_if_missing(filename, url):
 piper_voice = None
 
 try:
-    # Auto-download model & json if not present
+    # Auto-download working model & json
     download_file_if_missing(MODEL_FILENAME, MODEL_URL)
     download_file_if_missing(CONFIG_FILENAME, CONFIG_URL)
 
@@ -35,7 +36,7 @@ except Exception as e:
 
 @app.route('/')
 def home():
-    return "Luma Voice Server Active with Auto-Piper Download!"
+    return "Luma Voice Server Active with Piper AI!"
 
 @app.route('/voice', methods=['GET'])
 def text_to_speech():
