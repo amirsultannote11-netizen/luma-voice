@@ -88,22 +88,13 @@ def load_piper():
 # ─────────────────────────────────────────────
 # Audio generation
 # ─────────────────────────────────────────────
-def generate_piper_wav(text, rate_pct=0, pitch_hz=0):
+def generate_piper_wav(text):
     if piper_voice is None:
         raise RuntimeError("Piper voice is not loaded")
 
-    # 🟢 ریٹ (Rate/Speed) کو Piper کے length_scale میں تبدیل کرنا
-    # ESP32 سے ریٹ فیصد میں آتا ہے (جیسے -12% یا +10%)
-    length_scale = 1.0
-    if rate_pct != 0:
-        length_scale = 1.0 - (float(rate_pct) / 100.0)
-        if length_scale < 0.2: length_scale = 0.2
-        if length_scale > 3.0: length_scale = 3.0
-
     wav_io = io.BytesIO()
     with wave.open(wav_io, "wb") as wav_file:
-        # synthesize_wav میں length_scale اور pitch پیرامیٹرز پاس کیے گئے ہیں
-        piper_voice.synthesize_wav(text, wav_file, length_scale=length_scale)
+        piper_voice.synthesize_wav(text, wav_file)
 
     audio_data = wav_io.getvalue()
     if len(audio_data) <= 44:
@@ -189,21 +180,6 @@ def voice():
 
     text = text.strip()
     lang = request.args.get("lang", "ur").strip().lower()
-    
-    # 🟢 ESP32 سے آنے والے rate اور pitch پیرامیٹرز کو ریسیو کرنا
-    rate_str = request.args.get("rate", "0").replace("%", "").strip()
-    pitch_str = request.args.get("pitch", "0").replace("Hz", "").strip()
-    
-    rate_pct = 0
-    pitch_hz = 0
-    try:
-        rate_pct = int(rate_str)
-    except ValueError:
-        pass
-    try:
-        pitch_hz = int(pitch_str)
-    except ValueError:
-        pass
 
     if not text:
         return jsonify({
@@ -226,8 +202,7 @@ def voice():
     # Urdu: Piper first (converted to MP3).
     elif piper_voice is not None:
         try:
-            # 🟢 یہاں جنریٹ کرتے وقت rate_pct اور pitch_hz پاس کیے گئے ہیں
-            audio = wav_to_mp3(generate_piper_wav(text, rate_pct=rate_pct, pitch_hz=pitch_hz))
+            audio = wav_to_mp3(generate_piper_wav(text))
             logger.info("PIPER MP3 SUCCESS: %d bytes", len(audio))
             return mp3_response(audio, "piper-mp3")
         except Exception:
