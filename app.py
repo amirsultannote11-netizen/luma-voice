@@ -1,17 +1,15 @@
 import os
 import io
 import urllib.request
-from flask import Flask, request, Response
+from flask import Flask, request, make_response
 from piper import PiperVoice
 from gtts import gTTS
 
 app = Flask(__name__)
 
-# Model and Config filenames
 MODEL_FILENAME = "ur_PK-aegis_female-medium.onnx"
 CONFIG_FILENAME = "ur_PK-aegis_female-medium.onnx.json"
 
-# Direct URLs
 MODEL_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/main/ur/ur_PK/aegis_female/medium/ur_PK-aegis_female-medium.onnx"
 CONFIG_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/main/ur/ur_PK/aegis_female/medium/ur_PK-aegis_female-medium.onnx.json"
 
@@ -43,42 +41,36 @@ def text_to_speech():
     if not user_text:
         return "No text provided", 400
 
-    # 1. Try Piper AI TTS
+    # 1. Try Piper AI TTS (WAV Audio)
     if piper_voice:
         try:
             wav_io = io.BytesIO()
             piper_voice.synthesize(user_text, wav_io)
-            audio_data = wav_io.getvalue()
+            audio_bytes = wav_io.getvalue()
             
-            # Sending audio with explicit Content-Length for ESP32
-            return Response(
-                audio_data,
-                mimetype="audio/wav",
-                headers={
-                    "Content-Length": str(len(audio_data)),
-                    "Accept-Ranges": "bytes"
-                }
-            )
+            response = make_response(audio_bytes)
+            response.headers.set('Content-Type', 'audio/wav')
+            response.headers.set('Content-Length', str(len(audio_bytes)))
+            response.headers.set('Accept-Ranges', 'bytes')
+            response.headers.set('Connection', 'close')
+            return response
         except Exception as e:
             print(f"Piper Synthesis Error: {e}")
 
-    # 2. Backup Google TTS
+    # 2. Backup Google TTS (MP3 Audio)
     try:
         print("Using Google TTS Backup...")
         tts = gTTS(text=user_text, lang='ur', slow=False)
         mp3_io = io.BytesIO()
         tts.write_to_fp(mp3_io)
-        audio_data = mp3_io.getvalue()
+        audio_bytes = mp3_io.getvalue()
         
-        # Sending audio with explicit Content-Length for ESP32
-        return Response(
-            audio_data,
-            mimetype="audio/mpeg",
-            headers={
-                "Content-Length": str(len(audio_data)),
-                "Accept-Ranges": "bytes"
-            }
-        )
+        response = make_response(audio_bytes)
+        response.headers.set('Content-Type', 'audio/mpeg')
+        response.headers.set('Content-Length', str(len(audio_bytes)))
+        response.headers.set('Accept-Ranges', 'bytes')
+        response.headers.set('Connection', 'close')
+        return response
     except Exception as e:
         return f"Error: {e}", 500
 
