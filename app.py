@@ -1,5 +1,6 @@
 import os
 import io
+import re
 import json
 import wave
 import uuid
@@ -8,8 +9,15 @@ import urllib.request
 import urllib.error
 
 import lameenc
+import numpy as np
 from flask import Flask, request, Response, jsonify
 from piper import PiperVoice
+
+try:
+    # piper-tts 1.3+ : speed control (length_scale) lives here
+    from piper import SynthesisConfig
+except Exception:
+    SynthesisConfig = None
 from gtts import gTTS
 
 app = Flask(__name__)
@@ -88,13 +96,18 @@ def load_piper():
 # ─────────────────────────────────────────────
 # Audio generation
 # ─────────────────────────────────────────────
-def generate_piper_wav(text):
+def generate_piper_wav(text, length_scale=1.0):
+    """length_scale > 1 = slower speech, < 1 = faster speech."""
     if piper_voice is None:
         raise RuntimeError("Piper voice is not loaded")
 
     wav_io = io.BytesIO()
     with wave.open(wav_io, "wb") as wav_file:
-        piper_voice.synthesize_wav(text, wav_file)
+        if SynthesisConfig is not None and abs(length_scale - 1.0) > 0.01:
+            syn = SynthesisConfig(length_scale=length_scale)
+            piper_voice.synthesize_wav(text, wav_file, syn_config=syn)
+        else:
+            piper_voice.synthesize_wav(text, wav_file)
 
     audio_data = wav_io.getvalue()
     if len(audio_data) <= 44:
@@ -102,7 +115,18 @@ def generate_piper_wav(text):
     return audio_data
 
 
-def wav_to_mp3(wav_bytes):
+def shift_pitch_pcm(pcm_bytes, factor):
+    """factor > 1 = higher pitch, < 1 = lower pitch (also changes duration;
+    the caller compensates with length_scale)."""
+    samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
+    n = len(samples)
+    new_n = max(1, int(n / factor))
+    positions = np.linspace(0, n - 1, new_n)
+    shifted = np.interp(positions, np.arange(n), samples)
+    return np.clip(shifted, -32768, 32767).astype(np.int16).tobytes()
+
+
+def wav_to_mp3(wav_bytes, pitch_factor=1.0):
     """WAV (16-bit PCM) -> MP3. About 7x smaller, so ESP32 does not stutter."""
     with wave.open(io.BytesIO(wav_bytes), "rb") as w:
         channels = w.getnchannels()
@@ -114,6 +138,9 @@ def wav_to_mp3(wav_bytes):
         raise RuntimeError("Only 16-bit WAV is supported")
     if not pcm:
         raise RuntimeError("WAV has no audio frames")
+
+    if abs(pitch_factor - 1.0) > 0.005:
+        pcm = shift_pitch_pcm(pcm, pitch_factor)
 
     enc = lameenc.Encoder()
     enc.set_bit_rate(MP3_BITRATE)
@@ -149,6 +176,29 @@ def mp3_response(audio, engine):
     )
 
 
+def parse_number(value, default=0.0):
+    """'-12%' -> -12.0 , '5Hz' -> 5.0"""
+    match = re.search(r"[-+]?\d+(?:\.\d+)?", value or "")
+    try:
+        return float(match.group()) if match else default
+    except ValueError:
+        return default
+
+
+def voice_params():
+    """Read the Speed (rate) and Pitch sliders sent by the ESP32."""
+    rate_pct = max(-50.0, min(50.0, parse_number(request.args.get("rate"))))
+    pitch_hz = max(-20.0, min(20.0, parse_number(request.args.get("pitch"))))
+
+    speed_scale = 1.0 / (1.0 + rate_pct / 100.0)   # +% = faster, -% = slower
+    pitch_factor = 2.0 ** (pitch_hz / 100.0)        # +Hz = higher pitch
+
+    # Raising the pitch shortens the audio, so we stretch the speech
+    # by the same factor to keep the speed the user selected.
+    length_scale = max(0.4, min(2.5, speed_scale * pitch_factor))
+    return rate_pct, pitch_hz, length_scale, pitch_factor
+
+
 # ─────────────────────────────────────────────
 # Routes
 # ─────────────────────────────────────────────
@@ -180,6 +230,7 @@ def voice():
 
     text = text.strip()
     lang = request.args.get("lang", "ur").strip().lower()
+    rate_pct, pitch_hz, length_scale, pitch_factor = voice_params()
 
     if not text:
         return jsonify({
@@ -202,8 +253,11 @@ def voice():
     # Urdu: Piper first (converted to MP3).
     elif piper_voice is not None:
         try:
-            audio = wav_to_mp3(generate_piper_wav(text))
-            logger.info("PIPER MP3 SUCCESS: %d bytes", len(audio))
+            audio = wav_to_mp3(generate_piper_wav(text, length_scale), pitch_factor)
+            logger.info(
+                "PIPER MP3 SUCCESS: %d bytes (rate=%s%% pitch=%sHz length_scale=%.2f)",
+                len(audio), rate_pct, pitch_hz, length_scale,
+            )
             return mp3_response(audio, "piper-mp3")
         except Exception:
             logger.exception("PIPER SYNTHESIS FAILED")
