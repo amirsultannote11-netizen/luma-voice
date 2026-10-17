@@ -218,12 +218,12 @@ def health():
     })
 
 
-# Finished MP3 files wait here for a few minutes so the ESP32 can fetch
-# them with a short URL (no more giant Urdu URLs).
+# Finished MP3 files wait here for a short time so the ESP32 can fetch
+# them with a short URL. (Memory optimized to 4 max items)
 AUDIO_CACHE = {}
 AUDIO_CACHE_LOCK = threading.Lock()
-AUDIO_TTL_SECONDS = 600
-AUDIO_CACHE_MAX_ITEMS = 12
+AUDIO_TTL_SECONDS = 300
+AUDIO_CACHE_MAX_ITEMS = 4
 
 
 def cache_put(audio, engine):
