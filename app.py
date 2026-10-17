@@ -17,7 +17,6 @@ from flask import Flask, request, Response, jsonify
 from piper import PiperVoice
 
 try:
-    # piper-tts 1.3+ : speed control (length_scale) lives here
     from piper import SynthesisConfig
 except Exception:
     SynthesisConfig = None
@@ -41,11 +40,8 @@ BASE_URL = (
 MODEL_URL = BASE_URL + MODEL_FILENAME
 CONFIG_URL = BASE_URL + CONFIG_FILENAME
 
-# MP3 bitrate (kbps). 48 is small enough for ESP32 streaming over HTTPS.
 MP3_BITRATE = 48
 
-# STT (speech to text) via Groq Whisper. Set GROQ_API_KEY in Render's
-# Environment tab. Do NOT write the key inside the code.
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_STT_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_STT_MODEL = "whisper-large-v3-turbo"
@@ -100,7 +96,6 @@ def load_piper():
 # Audio generation & Memory Optimization
 # ─────────────────────────────────────────────
 def generate_piper_wav(text, length_scale=1.0):
-    """length_scale > 1 = slower speech, < 1 = faster speech."""
     if piper_voice is None:
         raise RuntimeError("Piper voice is not loaded")
 
@@ -153,7 +148,7 @@ def wav_to_mp3(wav_bytes, pitch_factor=1.0):
     mp3 = bytes(enc.encode(pcm) + enc.flush())
 
     del pcm
-    gc.collect() # 🧹 میموری فوری صاف کریں
+    gc.collect()
 
     if not mp3:
         raise RuntimeError("MP3 encoding produced empty data")
@@ -220,8 +215,8 @@ def health():
 
 AUDIO_CACHE = {}
 AUDIO_CACHE_LOCK = threading.Lock()
-AUDIO_TTL_SECONDS = 180  # 3 منٹ بعد خودبخود اڑا دیں
-AUDIO_CACHE_MAX_ITEMS = 2  # ریم پر بوجھ کم رکھنے کے لیے زیادہ سے زیادہ صرف 2 آئٹم رکھیں
+AUDIO_TTL_SECONDS = 180
+AUDIO_CACHE_MAX_ITEMS = 2
 
 
 def cache_put(audio, engine):
@@ -234,8 +229,8 @@ def cache_put(audio, engine):
             oldest = min(AUDIO_CACHE, key=lambda k: AUDIO_CACHE[k]["t"])
             del AUDIO_CACHE[oldest]
         AUDIO_CACHE[audio_id] = {"audio": audio, "engine": engine, "t": now}
-    
-    gc.collect() # 🧹 صفائی
+
+    gc.collect()
     return audio_id
 
 
@@ -262,12 +257,12 @@ def synthesize(text, lang, length_scale, pitch_factor):
             engine = "piper-mp3"
         except Exception:
             logger.exception("PIPER SYNTHESIS FAILED")
-    
+
     if audio is None:
         audio = generate_google_mp3(text, "ur")
         engine = "google"
 
-    gc.collect() # 🧹 پروسیسنگ کے بعد ریم کو بالکل فری کر دیں
+    gc.collect()
     return audio, engine
 
 
@@ -347,14 +342,13 @@ def pcm_to_wav(pcm, sample_rate=16000):
     return val
 
 
-@app.route("/stt", methods=["POST"])
-def stt():
+# ─────────────────────────────────────────────
+# 🔹 پرانا ایک-شاٹ STT (برقرار)
+# ─────────────────────────────────────────────
+def _send_to_groq_stt(pcm, lang="ur"):
+    """پورے PCM کو WAV بنا کر Groq Whisper پر بھیجیں اور ٹیکسٹ لوٹائیں۔"""
     if not GROQ_API_KEY:
-        return Response("", status=500, mimetype="text/plain")
-
-    pcm = request.get_data()
-    if len(pcm) < 3200:
-        return Response("", status=200, mimetype="text/plain")
+        raise RuntimeError("GROQ_API_KEY not set")
 
     wav_bytes = pcm_to_wav(pcm, 16000)
     boundary = "----luma" + uuid.uuid4().hex
@@ -369,7 +363,7 @@ def stt():
     body = b""
     body += field("model", GROQ_STT_MODEL)
     body += field("response_format", "text")
-    body += field("language", "ur")
+    body += field("language", lang)
     body += (
         f"--{boundary}\r\n"
         'Content-Disposition: form-data; name="file"; filename="speech.wav"\r\n'
@@ -389,19 +383,128 @@ def stt():
         method="POST",
     )
 
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        text = resp.read().decode("utf-8", errors="replace").strip()
+
+    del body, wav_bytes
+    gc.collect()
+    return text
+
+
+@app.route("/stt", methods=["POST"])
+def stt():
+    if not GROQ_API_KEY:
+        return Response("", status=500, mimetype="text/plain")
+
+    pcm = request.get_data()
+    if len(pcm) < 3200:
+        return Response("", status=200, mimetype="text/plain")
+
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            text = resp.read().decode("utf-8", errors="replace").strip()
-        
-        del body, wav_bytes, pcm
-        gc.collect() # 🧹 صفائی
-        
+        text = _send_to_groq_stt(pcm, lang="ur")
+        del pcm
+        gc.collect()
         return Response(text, status=200, mimetype="text/plain; charset=utf-8")
     except Exception:
         logger.exception("STT FAILED")
         gc.collect()
 
     return Response("", status=500, mimetype="text/plain")
+
+
+# ─────────────────────────────────────────────
+# 🔹 نیا اسٹریمنگ STT (start / chunk / end)
+#    ریکارڈنگ کے دوران چھوٹے چھوٹے ٹکڑے
+#    سرور پر جمع ہوتے ہیں، پھر ایک ساتھ
+#    Whisper پر بھیجے جاتے ہیں۔ ESP32 پر
+#    کبھی بڑا بفر نہیں بنتا → میموری محفوظ۔
+# ─────────────────────────────────────────────
+STT_SESSIONS = {}
+STT_SESSIONS_LOCK = threading.Lock()
+STT_SESSION_TTL = 60
+STT_MAX_CHUNKS = 500  # ~500 * 4KB ≈ 2MB (کافی زیادہ)
+
+
+def cleanup_stt_sessions():
+    now = time.time()
+    with STT_SESSIONS_LOCK:
+        for sid in [k for k, v in STT_SESSIONS.items() if now - v["t"] > STT_SESSION_TTL]:
+            del STT_SESSIONS[sid]
+
+
+@app.route("/stt/start", methods=["POST"])
+def stt_start():
+    if not GROQ_API_KEY:
+        return Response("", status=500, mimetype="text/plain")
+
+    cleanup_stt_sessions()
+    session_id = uuid.uuid4().hex[:12]
+    with STT_SESSIONS_LOCK:
+        STT_SESSIONS[session_id] = {"chunks": [], "t": time.time()}
+
+    logger.info("STT session started: %s", session_id)
+    return Response(session_id, status=200, mimetype="text/plain")
+
+
+@app.route("/stt/chunk", methods=["POST"])
+def stt_chunk():
+    session_id = request.args.get("id", "").strip()
+    if not session_id:
+        return Response("", status=400)
+
+    chunk = request.get_data()
+    if not chunk:
+        return Response("", status=400)
+
+    with STT_SESSIONS_LOCK:
+        session = STT_SESSIONS.get(session_id)
+        if session is None:
+            return Response("session_expired", status=404, mimetype="text/plain")
+        if len(session["chunks"]) >= STT_MAX_CHUNKS:
+            return Response("too_long", status=413, mimetype="text/plain")
+        session["chunks"].append(chunk)
+        session["t"] = time.time()
+
+    return Response("OK", status=200, mimetype="text/plain")
+
+
+@app.route("/stt/end", methods=["POST"])
+def stt_end():
+    if not GROQ_API_KEY:
+        return Response("", status=500, mimetype="text/plain")
+
+    session_id = request.args.get("id", "").strip()
+    if not session_id:
+        return Response("", status=400)
+
+    with STT_SESSIONS_LOCK:
+        session = STT_SESSIONS.pop(session_id, None)
+
+    if session is None:
+        return Response("session_expired", status=404, mimetype="text/plain")
+
+    pcm = b"".join(session["chunks"])
+    total_chunks = len(session["chunks"])
+    del session
+    gc.collect()
+
+    logger.info("STT end: id=%s chunks=%d bytes=%d", session_id, total_chunks, len(pcm))
+
+    if len(pcm) < 3200:
+        del pcm
+        gc.collect()
+        return Response("", status=200, mimetype="text/plain")
+
+    try:
+        text = _send_to_groq_stt(pcm, lang="ur")
+        del pcm
+        gc.collect()
+        logger.info("STT end → text: %s", text[:80])
+        return Response(text, status=200, mimetype="text/plain; charset=utf-8")
+    except Exception:
+        logger.exception("STT END FAILED")
+        gc.collect()
+        return Response("", status=500, mimetype="text/plain")
 
 
 # Load the model before accepting requests.
