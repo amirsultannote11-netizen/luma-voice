@@ -7,6 +7,7 @@ import threading
 import wave
 import uuid
 import logging
+import gc
 import urllib.request
 import urllib.error
 
@@ -96,7 +97,7 @@ def load_piper():
 
 
 # ─────────────────────────────────────────────
-# Audio generation
+# Audio generation & Memory Optimization
 # ─────────────────────────────────────────────
 def generate_piper_wav(text, length_scale=1.0):
     """length_scale > 1 = slower speech, < 1 = faster speech."""
@@ -112,24 +113,24 @@ def generate_piper_wav(text, length_scale=1.0):
             piper_voice.synthesize_wav(text, wav_file)
 
     audio_data = wav_io.getvalue()
+    wav_io.close()
     if len(audio_data) <= 44:
         raise RuntimeError("Piper generated an empty WAV")
     return audio_data
 
 
 def shift_pitch_pcm(pcm_bytes, factor):
-    """factor > 1 = higher pitch, < 1 = lower pitch (also changes duration;
-    the caller compensates with length_scale)."""
     samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
     n = len(samples)
     new_n = max(1, int(n / factor))
     positions = np.linspace(0, n - 1, new_n)
     shifted = np.interp(positions, np.arange(n), samples)
-    return np.clip(shifted, -32768, 32767).astype(np.int16).tobytes()
+    res = np.clip(shifted, -32768, 32767).astype(np.int16).tobytes()
+    del samples, shifted, positions
+    return res
 
 
 def wav_to_mp3(wav_bytes, pitch_factor=1.0):
-    """WAV (16-bit PCM) -> MP3. About 7x smaller, so ESP32 does not stutter."""
     with wave.open(io.BytesIO(wav_bytes), "rb") as w:
         channels = w.getnchannels()
         sample_rate = w.getframerate()
@@ -151,6 +152,9 @@ def wav_to_mp3(wav_bytes, pitch_factor=1.0):
     enc.set_quality(2)
     mp3 = bytes(enc.encode(pcm) + enc.flush())
 
+    del pcm
+    gc.collect() # 🧹 میموری فوری صاف کریں
+
     if not mp3:
         raise RuntimeError("MP3 encoding produced empty data")
     return mp3
@@ -161,6 +165,7 @@ def generate_google_mp3(text, lang="ur"):
     tts = gTTS(text=text, lang=lang, slow=False)
     tts.write_to_fp(output)
     audio_data = output.getvalue()
+    output.close()
     if not audio_data:
         raise RuntimeError("Google TTS generated empty audio")
     return audio_data
@@ -179,7 +184,6 @@ def mp3_response(audio, engine):
 
 
 def parse_number(value, default=0.0):
-    """'-12%' -> -12.0 , '5Hz' -> 5.0"""
     match = re.search(r"[-+]?\d+(?:\.\d+)?", value or "")
     try:
         return float(match.group()) if match else default
@@ -188,21 +192,17 @@ def parse_number(value, default=0.0):
 
 
 def voice_params():
-    """Read the Speed (rate) and Pitch sliders sent by the ESP32."""
     rate_pct = max(-50.0, min(50.0, parse_number(request.args.get("rate"))))
     pitch_hz = max(-20.0, min(20.0, parse_number(request.args.get("pitch"))))
 
-    speed_scale = 1.0 / (1.0 + rate_pct / 100.0)   # +% = faster, -% = slower
-    pitch_factor = 2.0 ** (pitch_hz / 100.0)        # +Hz = higher pitch
-
-    # Raising the pitch shortens the audio, so we stretch the speech
-    # by the same factor to keep the speed the user selected.
+    speed_scale = 1.0 / (1.0 + rate_pct / 100.0)
+    pitch_factor = 2.0 ** (pitch_hz / 100.0)
     length_scale = max(0.4, min(2.5, speed_scale * pitch_factor))
     return rate_pct, pitch_hz, length_scale, pitch_factor
 
 
 # ─────────────────────────────────────────────
-# Routes
+# Routes & Strict Memory Caching
 # ─────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def home():
@@ -218,12 +218,10 @@ def health():
     })
 
 
-# Finished MP3 files wait here for a short time so the ESP32 can fetch
-# them with a short URL. (Memory optimized to 4 max items)
 AUDIO_CACHE = {}
 AUDIO_CACHE_LOCK = threading.Lock()
-AUDIO_TTL_SECONDS = 300
-AUDIO_CACHE_MAX_ITEMS = 4
+AUDIO_TTL_SECONDS = 180  # 3 منٹ بعد خودبخود اڑا دیں
+AUDIO_CACHE_MAX_ITEMS = 2  # ریم پر بوجھ کم رکھنے کے لیے زیادہ سے زیادہ صرف 2 آئٹم رکھیں
 
 
 def cache_put(audio, engine):
@@ -236,6 +234,8 @@ def cache_put(audio, engine):
             oldest = min(AUDIO_CACHE, key=lambda k: AUDIO_CACHE[k]["t"])
             del AUDIO_CACHE[oldest]
         AUDIO_CACHE[audio_id] = {"audio": audio, "engine": engine, "t": now}
+    
+    gc.collect() # 🧹 صفائی
     return audio_id
 
 
@@ -246,39 +246,33 @@ def cache_get(audio_id):
 
 
 def synthesize(text, lang, length_scale, pitch_factor):
-    """Returns (mp3_bytes, engine_name). Piper first, Google as backup."""
-    # English text: Urdu Piper voice cannot read it well, so use Google.
+    audio = None
+    engine = "google"
     if lang == "en":
         try:
             audio = generate_google_mp3(text, "en")
-            logger.info("GOOGLE EN SUCCESS: %d bytes", len(audio))
-            return audio, "google-en"
+            engine = "google-en"
         except Exception:
             logger.exception("GOOGLE EN FAILED")
-
-    # Urdu: Piper first (converted to MP3).
     elif piper_voice is not None:
         try:
-            audio = wav_to_mp3(generate_piper_wav(text, length_scale), pitch_factor)
-            logger.info(
-                "PIPER MP3 SUCCESS: %d bytes (length_scale=%.2f pitch_factor=%.2f)",
-                len(audio), length_scale, pitch_factor,
-            )
-            return audio, "piper-mp3"
+            wav_data = generate_piper_wav(text, length_scale)
+            audio = wav_to_mp3(wav_data, pitch_factor)
+            del wav_data
+            engine = "piper-mp3"
         except Exception:
             logger.exception("PIPER SYNTHESIS FAILED")
-    else:
-        logger.error("Piper unavailable; trying Google TTS")
+    
+    if audio is None:
+        audio = generate_google_mp3(text, "ur")
+        engine = "google"
 
-    # Fallback: Google Urdu.
-    audio = generate_google_mp3(text, "ur")
-    logger.info("GOOGLE TTS SUCCESS: %d bytes", len(audio))
-    return audio, "google"
+    gc.collect() # 🧹 پروسیسنگ کے بعد ریم کو بالکل فری کر دیں
+    return audio, engine
 
 
 @app.route("/voice", methods=["GET", "POST"])
 def voice():
-    """Old style: text inside the URL. Still works for short text."""
     if request.method == "POST":
         text = request.form.get("text", "")
         if not text and request.is_json:
@@ -294,37 +288,29 @@ def voice():
     rate_pct, pitch_hz, length_scale, pitch_factor = voice_params()
 
     if not text:
-        return jsonify({
-            "error": "No text provided",
-            "example": "/voice?text=Assalam%20o%20Alaikum",
-        }), 400
-
+        return jsonify({"error": "No text provided"}), 400
     if len(text) > 2000:
         return jsonify({"error": "Text too long"}), 413
 
     try:
         audio, engine = synthesize(text, lang, length_scale, pitch_factor)
-        return mp3_response(audio, engine)
+        resp = mp3_response(audio, engine)
+        del audio
+        gc.collect()
+        return resp
     except Exception:
         logger.exception("ALL TTS ENGINES FAILED")
-        return jsonify({
-            "error": "Both TTS engines failed",
-            "details": "Check Render logs",
-        }), 500
+        return jsonify({"error": "TTS failed"}), 500
 
 
 @app.route("/tts", methods=["POST"])
 def tts():
-    """New style: ESP32 POSTs the text (any length). We build ONE MP3,
-    keep it for a few minutes and answer with a short id."""
     text = request.get_data(as_text=True).strip()
     lang = request.args.get("lang", "ur").strip().lower()
     rate_pct, pitch_hz, length_scale, pitch_factor = voice_params()
 
-    if not text:
+    if not text or len(text) > 2000:
         return Response("", status=400, mimetype="text/plain")
-    if len(text) > 2000:
-        return Response("", status=413, mimetype="text/plain")
 
     try:
         audio, engine = synthesize(text, lang, length_scale, pitch_factor)
@@ -333,10 +319,8 @@ def tts():
         return Response("", status=500, mimetype="text/plain")
 
     audio_id = cache_put(audio, engine)
-    logger.info(
-        "TTS READY id=%s engine=%s bytes=%d (rate=%s%% pitch=%sHz)",
-        audio_id, engine, len(audio), rate_pct, pitch_hz,
-    )
+    del audio
+    gc.collect()
     return Response(audio_id, status=200, mimetype="text/plain")
 
 
@@ -346,7 +330,9 @@ def audio_file(audio_id):
     if not found:
         return Response("Audio expired or not found", status=404, mimetype="text/plain")
     audio, engine = found
-    return mp3_response(audio, engine)
+    resp = mp3_response(audio, engine)
+    gc.collect()
+    return resp
 
 
 def pcm_to_wav(pcm, sample_rate=16000):
@@ -356,18 +342,18 @@ def pcm_to_wav(pcm, sample_rate=16000):
         w.setsampwidth(2)
         w.setframerate(sample_rate)
         w.writeframes(pcm)
-    return buf.getvalue()
+    val = buf.getvalue()
+    buf.close()
+    return val
 
 
 @app.route("/stt", methods=["POST"])
 def stt():
-    """ESP32 sends raw 16kHz 16-bit mono PCM. We return plain text."""
     if not GROQ_API_KEY:
-        logger.error("GROQ_API_KEY is not set on the server")
         return Response("", status=500, mimetype="text/plain")
 
     pcm = request.get_data()
-    if len(pcm) < 3200:  # less than 0.1 second
+    if len(pcm) < 3200:
         return Response("", status=200, mimetype="text/plain")
 
     wav_bytes = pcm_to_wav(pcm, 16000)
@@ -406,12 +392,14 @@ def stt():
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
             text = resp.read().decode("utf-8", errors="replace").strip()
-        logger.info("STT RESULT: %s", text)
+        
+        del body, wav_bytes, pcm
+        gc.collect() # 🧹 صفائی
+        
         return Response(text, status=200, mimetype="text/plain; charset=utf-8")
-    except urllib.error.HTTPError as e:
-        logger.error("STT HTTP error %s: %s", e.code, e.read()[:300])
     except Exception:
         logger.exception("STT FAILED")
+        gc.collect()
 
     return Response("", status=500, mimetype="text/plain")
 
