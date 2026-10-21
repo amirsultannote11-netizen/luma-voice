@@ -40,6 +40,16 @@ BASE_URL = (
 MODEL_URL = BASE_URL + MODEL_FILENAME
 CONFIG_URL = BASE_URL + CONFIG_FILENAME
 
+# ── English Female (Amy) ──
+EN_MODEL_FILENAME = "en_US-amy-medium.onnx"
+EN_CONFIG_FILENAME = "en_US-amy-medium.onnx.json"
+EN_BASE_URL = (
+    "https://huggingface.co/rhasspy/piper-voices/resolve/main/"
+    "en/en_US/amy/medium/"
+)
+EN_MODEL_URL = EN_BASE_URL + EN_MODEL_FILENAME
+EN_CONFIG_URL = EN_BASE_URL + EN_CONFIG_FILENAME
+
 MP3_BITRATE = 48
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
@@ -47,6 +57,10 @@ GROQ_STT_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_STT_MODEL = "whisper-large-v3-turbo"
 
 piper_voice = None
+piper_en = None
+
+# ایک وقت میں ایک ہی آواز بنے تاکہ میموری/CPU پر دباؤ نہ پڑے
+SYNTH_LOCK = threading.Lock()
 
 
 # ─────────────────────────────────────────────
@@ -81,31 +95,44 @@ def download_file(filename, url):
 
 
 def load_piper():
-    global piper_voice
+    global piper_voice, piper_en
+
+    # اردو آواز
     try:
         download_file(MODEL_FILENAME, MODEL_URL)
         download_file(CONFIG_FILENAME, CONFIG_URL)
         piper_voice = PiperVoice.load(MODEL_FILENAME, config_path=CONFIG_FILENAME)
-        logger.info("PIPER VOICE LOADED SUCCESSFULLY")
+        logger.info("PIPER URDU VOICE LOADED SUCCESSFULLY")
     except Exception:
         piper_voice = None
-        logger.exception("PIPER MODEL LOAD FAILED")
+        logger.exception("PIPER URDU MODEL LOAD FAILED")
+
+    # انگلش فیمیل آواز
+    try:
+        download_file(EN_MODEL_FILENAME, EN_MODEL_URL)
+        download_file(EN_CONFIG_FILENAME, EN_CONFIG_URL)
+        piper_en = PiperVoice.load(EN_MODEL_FILENAME, config_path=EN_CONFIG_FILENAME)
+        logger.info("PIPER ENGLISH FEMALE VOICE LOADED SUCCESSFULLY")
+    except Exception:
+        piper_en = None
+        logger.exception("PIPER ENGLISH MODEL LOAD FAILED")
 
 
 # ─────────────────────────────────────────────
 # Audio generation & Memory Optimization
 # ─────────────────────────────────────────────
-def generate_piper_wav(text, length_scale=1.0):
-    if piper_voice is None:
+def generate_piper_wav(text, length_scale=1.0, voice=None):
+    voice = voice or piper_voice
+    if voice is None:
         raise RuntimeError("Piper voice is not loaded")
 
     wav_io = io.BytesIO()
     with wave.open(wav_io, "wb") as wav_file:
         if SynthesisConfig is not None and abs(length_scale - 1.0) > 0.01:
             syn = SynthesisConfig(length_scale=length_scale)
-            piper_voice.synthesize_wav(text, wav_file, syn_config=syn)
+            voice.synthesize_wav(text, wav_file, syn_config=syn)
         else:
-            piper_voice.synthesize_wav(text, wav_file)
+            voice.synthesize_wav(text, wav_file)
 
     audio_data = wav_io.getvalue()
     wav_io.close()
@@ -209,6 +236,7 @@ def health():
     return jsonify({
         "server": "online",
         "piper_loaded": piper_voice is not None,
+        "piper_en_loaded": piper_en is not None,
         "stt_key_set": bool(GROQ_API_KEY),
     })
 
@@ -243,24 +271,29 @@ def cache_get(audio_id):
 def synthesize(text, lang, length_scale, pitch_factor):
     audio = None
     engine = "google"
-    if lang == "en":
+    is_en = (lang == "en")
+
+    # انگلش کے لیے Piper English Female (Amy)، باقی کے لیے Piper اردو
+    voice = piper_en if is_en else piper_voice
+
+    if voice is not None:
         try:
-            audio = generate_google_mp3(text, "en")
-            engine = "google-en"
-        except Exception:
-            logger.exception("GOOGLE EN FAILED")
-    elif piper_voice is not None:
-        try:
-            wav_data = generate_piper_wav(text, length_scale)
-            audio = wav_to_mp3(wav_data, pitch_factor)
-            del wav_data
-            engine = "piper-mp3"
+            with SYNTH_LOCK:
+                wav_data = generate_piper_wav(text, length_scale, voice)
+                audio = wav_to_mp3(wav_data, pitch_factor)
+                del wav_data
+            engine = "piper-en-female" if is_en else "piper-mp3"
         except Exception:
             logger.exception("PIPER SYNTHESIS FAILED")
 
+    # بیک اپ: گوگل
     if audio is None:
-        audio = generate_google_mp3(text, "ur")
-        engine = "google"
+        try:
+            audio = generate_google_mp3(text, "en" if is_en else "ur")
+            engine = "google-en" if is_en else "google"
+        except Exception:
+            logger.exception("GOOGLE TTS FAILED")
+            raise
 
     gc.collect()
     return audio, engine
@@ -343,14 +376,16 @@ def pcm_to_wav(pcm, sample_rate=16000):
 
 
 # ─────────────────────────────────────────────
-# 🔹 پرانا ایک-شاٹ STT (برقرار)
+# 🔹 STT (Groq Whisper)
+#    lang = "en"  → صرف انگلش
+#    lang = "ur"  → صرف اردو
+#    lang = ""    → آٹو: Whisper خود زبان پہچانتا ہے۔
+#                   اگر انگلش نہ ہو تو اردو کے ساتھ دوبارہ
+#                   چلایا جاتا ہے تاکہ اردو رسم الخط ہی ملے
+#                   (ورنہ Whisper اردو کو ہندی میں لکھ دیتا ہے)۔
 # ─────────────────────────────────────────────
-def _send_to_groq_stt(pcm, lang="ur"):
-    """پورے PCM کو WAV بنا کر Groq Whisper پر بھیجیں اور ٹیکسٹ لوٹائیں۔"""
-    if not GROQ_API_KEY:
-        raise RuntimeError("GROQ_API_KEY not set")
-
-    wav_bytes = pcm_to_wav(pcm, 16000)
+def _groq_request(wav_bytes, lang, verbose):
+    """Groq Whisper کو ایک کال۔ (text, detected_language) لوٹاتا ہے۔"""
     boundary = "----luma" + uuid.uuid4().hex
 
     def field(name, value):
@@ -362,8 +397,9 @@ def _send_to_groq_stt(pcm, lang="ur"):
 
     body = b""
     body += field("model", GROQ_STT_MODEL)
-    body += field("response_format", "text")
-    body += field("language", lang)
+    body += field("response_format", "verbose_json" if verbose else "text")
+    if lang:
+        body += field("language", lang)
     body += (
         f"--{boundary}\r\n"
         'Content-Disposition: form-data; name="file"; filename="speech.wav"\r\n'
@@ -384,9 +420,40 @@ def _send_to_groq_stt(pcm, lang="ur"):
     )
 
     with urllib.request.urlopen(req, timeout=60) as resp:
-        text = resp.read().decode("utf-8", errors="replace").strip()
+        raw = resp.read().decode("utf-8", errors="replace").strip()
 
-    del body, wav_bytes
+    del body
+
+    if verbose:
+        try:
+            data = json.loads(raw)
+            return str(data.get("text", "")).strip(), str(data.get("language", "")).strip().lower()
+        except Exception:
+            return raw, ""
+    return raw, lang
+
+
+def _send_to_groq_stt(pcm, lang=""):
+    """پورے PCM کو WAV بنا کر Groq Whisper پر بھیجیں اور ٹیکسٹ لوٹائیں۔"""
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY not set")
+
+    wav_bytes = pcm_to_wav(pcm, 16000)
+    lang = (lang or "").strip().lower()
+
+    if lang in ("en", "ur"):
+        text, _ = _groq_request(wav_bytes, lang, False)
+    else:
+        text, detected = _groq_request(wav_bytes, "", True)
+        logger.info("STT auto-detected language: %s", detected)
+        if detected in ("english", "en"):
+            pass
+        elif detected in ("urdu", "ur") and text:
+            pass
+        else:
+            text, _ = _groq_request(wav_bytes, "ur", False)
+
+    del wav_bytes
     gc.collect()
     return text
 
@@ -400,8 +467,10 @@ def stt():
     if len(pcm) < 3200:
         return Response("", status=200, mimetype="text/plain")
 
+    lang = request.args.get("lang", "").strip().lower()
+
     try:
-        text = _send_to_groq_stt(pcm, lang="ur")
+        text = _send_to_groq_stt(pcm, lang=lang)
         del pcm
         gc.collect()
         return Response(text, status=200, mimetype="text/plain; charset=utf-8")
@@ -477,6 +546,8 @@ def stt_end():
     if not session_id:
         return Response("", status=400)
 
+    lang = request.args.get("lang", "").strip().lower()
+
     with STT_SESSIONS_LOCK:
         session = STT_SESSIONS.pop(session_id, None)
 
@@ -496,7 +567,7 @@ def stt_end():
         return Response("", status=200, mimetype="text/plain")
 
     try:
-        text = _send_to_groq_stt(pcm, lang="ur")
+        text = _send_to_groq_stt(pcm, lang=lang)
         del pcm
         gc.collect()
         logger.info("STT end → text: %s", text[:80])
