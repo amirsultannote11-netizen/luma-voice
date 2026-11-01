@@ -50,7 +50,7 @@ EN_BASE_URL = (
 EN_MODEL_URL = EN_BASE_URL + EN_MODEL_FILENAME
 EN_CONFIG_URL = EN_BASE_URL + EN_CONFIG_FILENAME
 
-MP3_BITRATE = 48
+MP3_BITRATE = 64
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_STT_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
@@ -243,8 +243,8 @@ def health():
 
 AUDIO_CACHE = {}
 AUDIO_CACHE_LOCK = threading.Lock()
-AUDIO_TTL_SECONDS = 180
-AUDIO_CACHE_MAX_ITEMS = 2
+AUDIO_TTL_SECONDS = 300
+AUDIO_CACHE_MAX_ITEMS = 3
 
 
 def cache_put(audio, engine):
@@ -337,7 +337,7 @@ def tts():
     lang = request.args.get("lang", "ur").strip().lower()
     rate_pct, pitch_hz, length_scale, pitch_factor = voice_params()
 
-    if not text or len(text) > 2000:
+    if not text or len(text) > 3000:
         return Response("", status=400, mimetype="text/plain")
 
     try:
