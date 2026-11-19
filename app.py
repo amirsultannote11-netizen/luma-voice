@@ -598,6 +598,37 @@ def tts():
     return Response(job_id, status=200, mimetype="text/plain")
 
 
+def _full_response(job):
+    """وہی ٹکڑے بناتا ہے مگر سب جمع کر کے ایک ہی جواب میں دیتا ہے (Content-Length کے ساتھ)۔"""
+    global ACTIVE_CANCEL
+    cancel = threading.Event()
+    with ACTIVE_LOCK:
+        if ACTIVE_CANCEL is not None:
+            ACTIVE_CANCEL.set()
+        ACTIVE_CANCEL = cancel
+
+    q = queue.Queue(maxsize=STREAM_QUEUE_MAX)
+    threading.Thread(target=_producer, args=(job, q, cancel), daemon=True).start()
+    parts = []
+    try:
+        while True:
+            try:
+                item = q.get(timeout=STREAM_IDLE_TIMEOUT)
+            except queue.Empty:
+                break
+            if item is None:
+                break
+            parts.append(item)
+    finally:
+        cancel.set()
+
+    audio = b"".join(parts)
+    del parts
+    if not audio:
+        return Response("TTS failed", status=500, mimetype="text/plain")
+    return mp3_response(audio, "piper-full")
+
+
 @app.route("/audio/<audio_id>.mp3", methods=["GET"])
 def audio_file(audio_id):
     """آڈیو بنتے ہی ٹکڑا بہ ٹکڑا بھیجتا ہے (chunked streaming)۔"""
@@ -605,6 +636,10 @@ def audio_file(audio_id):
     job = job_get(audio_id)
     if not job:
         return Response("Audio expired or not found", status=404, mimetype="text/plain")
+
+    # ?full=1 → پوری MP3 Content-Length کے ساتھ (ESP32 کے فلیش ڈاؤن لوڈ موڈ کے لیے، بغیر chunked)
+    if request.args.get("full"):
+        return _full_response(job)
 
     cancel = threading.Event()
     with ACTIVE_LOCK:
