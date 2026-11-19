@@ -3,6 +3,7 @@ import io
 import re
 import time
 import json
+import queue
 import threading
 import wave
 import uuid
@@ -26,6 +27,40 @@ app = Flask(__name__)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("LumaVoice")
+
+# ─────────────────────────────────────────────
+# ONNX Runtime کی میموری کم رکھنا
+#   بڑی "arena" میموری بند، تھریڈ PIPER_THREADS (ڈیفالٹ 1)۔ Piper سے پہلے لگنا ضروری ہے۔
+# ─────────────────────────────────────────────
+PIPER_THREADS = int(os.environ.get("PIPER_THREADS", "1"))
+try:
+    import onnxruntime as _ort
+
+    _orig_session = _ort.InferenceSession
+
+    def _lean_session(path, sess_options=None, *args, **kwargs):
+        so = sess_options or _ort.SessionOptions()
+        so.enable_cpu_mem_arena = False
+        so.enable_mem_pattern = False
+        so.intra_op_num_threads = PIPER_THREADS
+        so.inter_op_num_threads = 1
+        return _orig_session(path, so, *args, **kwargs)
+
+    _ort.InferenceSession = _lean_session
+    logger.info("ONNX lean session patch applied (threads=%d)", PIPER_THREADS)
+except Exception:
+    logger.exception("ONNX lean session patch failed (continuing without it)")
+
+
+def trim_memory():
+    """Python اور C دونوں کی خالی میموری سسٹم کو واپس دو۔"""
+    gc.collect()
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
 
 # ─────────────────────────────────────────────
 # Settings
@@ -52,12 +87,31 @@ EN_CONFIG_URL = EN_BASE_URL + EN_CONFIG_FILENAME
 
 MP3_BITRATE = 64
 
+# ایک وقت میں میموری میں کتنی Piper آوازیں رہ سکتی ہیں (1 = کم میموری، 2 = دونوں ساتھ)
+MAX_LOADED_VOICES = int(os.environ.get("PIPER_MAX_VOICES", "1"))
+
+# /voice (غیر اسٹریمنگ) کے لیے ٹکڑے کی حد
+CHUNK_CHARS = int(os.environ.get("TTS_CHUNK_CHARS", "140"))
+
+# ── اسٹریمنگ کے ٹکڑوں کی حدیں ──
+# پہلا ٹکڑا بہت چھوٹا تاکہ آواز جلدی شروع ہو، پھر آہستہ آہستہ بڑے۔
+STREAM_LIMITS = [
+    int(os.environ.get("TTS_FIRST_CHARS", "60")),
+    int(os.environ.get("TTS_SECOND_CHARS", "100")),
+]
+STREAM_QUEUE_MAX = 3          # تیار شدہ ٹکڑے جو ایک وقت میں قطار میں رہ سکتے ہیں (میموری کی حد)
+STREAM_IDLE_TIMEOUT = 90      # اتنی دیر کوئی ٹکڑا نہ آئے تو اسٹریم بند
+MAX_TEXT_CHARS = 1200         # اس سے لمبا متن رد
+
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_STT_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_STT_MODEL = "whisper-large-v3-turbo"
 
-piper_voice = None
-piper_en = None
+VOICE_FILES = {
+    "ur": (MODEL_FILENAME, MODEL_URL, CONFIG_FILENAME, CONFIG_URL),
+    "en": (EN_MODEL_FILENAME, EN_MODEL_URL, EN_CONFIG_FILENAME, EN_CONFIG_URL),
+}
+VOICES = {"ur": None, "en": None}
 
 # ایک وقت میں ایک ہی آواز بنے تاکہ میموری/CPU پر دباؤ نہ پڑے
 SYNTH_LOCK = threading.Lock()
@@ -94,35 +148,118 @@ def download_file(filename, url):
             os.remove(temp_file)
 
 
+def get_voice(lang):
+    """مطلوبہ آواز لوٹاتا ہے۔ ضرورت ہو تو لوڈ کرتا ہے اور حد سے زیادہ ہونے پر پرانی ہٹاتا ہے۔
+    اسے SYNTH_LOCK کے اندر ہی بلانا ہے (load_piper کے سوا)۔"""
+    key = "en" if lang == "en" else "ur"
+    if VOICES[key] is not None:
+        return VOICES[key]
+
+    loaded = [k for k, v in VOICES.items() if v is not None]
+    while loaded and len(loaded) >= MAX_LOADED_VOICES:
+        victim = loaded.pop(0)
+        VOICES[victim] = None
+        logger.info("Unloaded voice: %s (memory limit)", victim)
+    trim_memory()
+
+    model_f, model_u, conf_f, conf_u = VOICE_FILES[key]
+    try:
+        download_file(model_f, model_u)
+        download_file(conf_f, conf_u)
+        VOICES[key] = PiperVoice.load(model_f, config_path=conf_f)
+        logger.info("PIPER VOICE LOADED: %s", key)
+    except Exception:
+        VOICES[key] = None
+        logger.exception("PIPER %s MODEL LOAD FAILED", key)
+    trim_memory()
+    return VOICES[key]
+
+
 def load_piper():
-    global piper_voice, piper_en
-
-    # اردو آواز
+    """شروع میں صرف اردو لوڈ ہوتی ہے، اور ایک چھوٹا سا ٹیسٹ جملہ چلا کر 'گرم' کر دیا جاتا ہے
+    تاکہ پہلی اصل درخواست پر ONNX کی پہلی سست رن نہ ہو۔"""
+    voice = get_voice("ur")
+    if voice is None:
+        return
     try:
-        download_file(MODEL_FILENAME, MODEL_URL)
-        download_file(CONFIG_FILENAME, CONFIG_URL)
-        piper_voice = PiperVoice.load(MODEL_FILENAME, config_path=CONFIG_FILENAME)
-        logger.info("PIPER URDU VOICE LOADED SUCCESSFULLY")
+        t0 = time.time()
+        generate_piper_wav("جی ہاں۔", 1.0, voice)
+        logger.info("Piper warm-up done in %.2fs", time.time() - t0)
     except Exception:
-        piper_voice = None
-        logger.exception("PIPER URDU MODEL LOAD FAILED")
-
-    # انگلش فیمیل آواز
-    try:
-        download_file(EN_MODEL_FILENAME, EN_MODEL_URL)
-        download_file(EN_CONFIG_FILENAME, EN_CONFIG_URL)
-        piper_en = PiperVoice.load(EN_MODEL_FILENAME, config_path=EN_CONFIG_FILENAME)
-        logger.info("PIPER ENGLISH FEMALE VOICE LOADED SUCCESSFULLY")
-    except Exception:
-        piper_en = None
-        logger.exception("PIPER ENGLISH MODEL LOAD FAILED")
+        logger.exception("Piper warm-up failed (ignored)")
+    trim_memory()
 
 
 # ─────────────────────────────────────────────
-# Audio generation & Memory Optimization
+# Text chunking
+# ─────────────────────────────────────────────
+_SENT_SPLIT = re.compile(r"(?<=[۔؟!?.\n])\s+")
+_CUT_CHARS = "۔؟!?.\n،,؛;"
+
+
+def split_text(text, max_len=None):
+    """لمبے متن کو جملوں کے حساب سے چھوٹے ٹکڑوں میں توڑتا ہے (/voice کے لیے)۔"""
+    max_len = max_len or CHUNK_CHARS
+    sentences = [s.strip() for s in _SENT_SPLIT.split(text) if s.strip()]
+    chunks = []
+    cur = ""
+    for s in sentences:
+        while len(s) > max_len:
+            cut = max(s.rfind("،", 0, max_len), s.rfind(",", 0, max_len), s.rfind(" ", 0, max_len))
+            if cut < 40:
+                cut = max_len - 1
+            head, s = s[:cut + 1].strip(), s[cut + 1:].strip()
+            if cur:
+                chunks.append(cur)
+                cur = ""
+            if head:
+                chunks.append(head)
+        if not s:
+            continue
+        if len(cur) + len(s) + 1 <= max_len:
+            cur = (cur + " " + s).strip()
+        else:
+            if cur:
+                chunks.append(cur)
+            cur = s
+    if cur:
+        chunks.append(cur)
+    return chunks or [text]
+
+
+def _take(text, limit):
+    """متن سے زیادہ سے زیادہ `limit` حروف کا ٹکڑا لو، ترجیحاً جملے/کاما پر کاٹ کر۔
+    (ٹکڑا، بچا ہوا متن) لوٹاتا ہے۔"""
+    text = text.strip()
+    if len(text) <= limit:
+        return text, ""
+    window = text[:limit]
+    cut = max(window.rfind(c) for c in _CUT_CHARS)
+    if cut < limit * 0.3:
+        sp = window.rfind(" ")
+        cut = sp if sp >= limit * 0.3 else limit - 1
+    return text[:cut + 1].strip(), text[cut + 1:].strip()
+
+
+def split_for_stream(text):
+    """اسٹریمنگ کے لیے: پہلا ٹکڑا چھوٹا، دوسرا درمیانہ، باقی عام سائز کے۔"""
+    out = []
+    rest = text.strip()
+    i = 0
+    while rest:
+        limit = STREAM_LIMITS[i] if i < len(STREAM_LIMITS) else CHUNK_CHARS
+        head, rest = _take(rest, limit)
+        if head:
+            out.append(head)
+        i += 1
+    return out or [text.strip()]
+
+
+# ─────────────────────────────────────────────
+# Audio generation
 # ─────────────────────────────────────────────
 def generate_piper_wav(text, length_scale=1.0, voice=None):
-    voice = voice or piper_voice
+    """ایک چھوٹے ٹکڑے کی WAV بناتا ہے۔ آواز نہ بنے تو b'' لوٹاتا ہے۔"""
     if voice is None:
         raise RuntimeError("Piper voice is not loaded")
 
@@ -137,7 +274,7 @@ def generate_piper_wav(text, length_scale=1.0, voice=None):
     audio_data = wav_io.getvalue()
     wav_io.close()
     if len(audio_data) <= 44:
-        raise RuntimeError("Piper generated an empty WAV")
+        return b""
     return audio_data
 
 
@@ -145,38 +282,61 @@ def shift_pitch_pcm(pcm_bytes, factor):
     samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
     n = len(samples)
     new_n = max(1, int(n / factor))
-    positions = np.linspace(0, n - 1, new_n)
-    shifted = np.interp(positions, np.arange(n), samples)
+    positions = np.linspace(0, n - 1, new_n, dtype=np.float32)
+    shifted = np.interp(positions, np.arange(n, dtype=np.float32), samples)
     res = np.clip(shifted, -32768, 32767).astype(np.int16).tobytes()
     del samples, shifted, positions
     return res
 
 
-def wav_to_mp3(wav_bytes, pitch_factor=1.0):
-    with wave.open(io.BytesIO(wav_bytes), "rb") as w:
+def _wav_to_pcm(wav):
+    with wave.open(io.BytesIO(wav), "rb") as w:
         channels = w.getnchannels()
         sample_rate = w.getframerate()
         sample_width = w.getsampwidth()
         pcm = w.readframes(w.getnframes())
-
     if sample_width != 2:
         raise RuntimeError("Only 16-bit WAV is supported")
-    if not pcm:
-        raise RuntimeError("WAV has no audio frames")
+    return pcm, sample_rate, channels
 
-    if abs(pitch_factor - 1.0) > 0.005:
-        pcm = shift_pitch_pcm(pcm, pitch_factor)
 
+def _new_encoder(sample_rate, channels):
     enc = lameenc.Encoder()
     enc.set_bit_rate(MP3_BITRATE)
     enc.set_in_sample_rate(sample_rate)
     enc.set_channels(channels)
     enc.set_quality(2)
-    mp3 = bytes(enc.encode(pcm) + enc.flush())
+    return enc
 
-    del pcm
-    gc.collect()
 
+def generate_piper_mp3(text, length_scale, pitch_factor, voice):
+    """(/voice کے لیے) پورا متن ٹکڑوں میں بنا کر ایک ہی MP3 لوٹاتا ہے۔"""
+    enc = None
+    parts = []
+
+    for piece in split_text(text):
+        wav = generate_piper_wav(piece, length_scale, voice)
+        if not wav:
+            continue
+        pcm, sample_rate, channels = _wav_to_pcm(wav)
+        del wav
+        if not pcm:
+            continue
+        if abs(pitch_factor - 1.0) > 0.005:
+            pcm = shift_pitch_pcm(pcm, pitch_factor)
+        if enc is None:
+            enc = _new_encoder(sample_rate, channels)
+        data = enc.encode(pcm)
+        if data:
+            parts.append(bytes(data))
+        del pcm
+
+    if enc is None:
+        raise RuntimeError("Piper produced no audio")
+
+    parts.append(bytes(enc.flush()))
+    mp3 = b"".join(parts)
+    del parts
     if not mp3:
         raise RuntimeError("MP3 encoding produced empty data")
     return mp3
@@ -224,7 +384,7 @@ def voice_params():
 
 
 # ─────────────────────────────────────────────
-# Routes & Strict Memory Caching
+# Routes
 # ─────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def home():
@@ -235,58 +395,155 @@ def home():
 def health():
     return jsonify({
         "server": "online",
-        "piper_loaded": piper_voice is not None,
-        "piper_en_loaded": piper_en is not None,
+        "piper_loaded": VOICES["ur"] is not None,
+        "piper_en_loaded": VOICES["en"] is not None,
+        "max_loaded_voices": MAX_LOADED_VOICES,
         "stt_key_set": bool(GROQ_API_KEY),
     })
 
 
-AUDIO_CACHE = {}
-AUDIO_CACHE_LOCK = threading.Lock()
-AUDIO_TTL_SECONDS = 300
-AUDIO_CACHE_MAX_ITEMS = 3
+@app.route("/ping", methods=["GET"])
+def ping():
+    return "ok"
 
 
-def cache_put(audio, engine):
-    audio_id = uuid.uuid4().hex[:16]
+# ─────────────────────────────────────────────
+# Jobs: /tts صرف متن محفوظ کر کے فوراً آئی ڈی دیتا ہے (کوئی آڈیو نہیں بنتی)۔
+# آڈیو تب بنتی ہے جب ESP32 /audio/<id>.mp3 مانگے، اور بنتے ہی بھیجی جاتی ہے۔
+# صرف متن محفوظ ہوتا ہے، اس لیے میموری بالکل کم لگتی ہے۔
+# ─────────────────────────────────────────────
+JOBS = {}
+JOBS_LOCK = threading.Lock()
+JOB_TTL_SECONDS = 180
+JOB_MAX_ITEMS = 4
+
+ACTIVE_CANCEL = None          # چلتی ہوئی اسٹریم کو روکنے کا اشارہ
+ACTIVE_LOCK = threading.Lock()
+
+
+def job_put(text, lang, length_scale, pitch_factor):
+    job_id = uuid.uuid4().hex[:16]
     now = time.time()
-    with AUDIO_CACHE_LOCK:
-        for key in [k for k, v in AUDIO_CACHE.items() if now - v["t"] > AUDIO_TTL_SECONDS]:
-            del AUDIO_CACHE[key]
-        while len(AUDIO_CACHE) >= AUDIO_CACHE_MAX_ITEMS:
-            oldest = min(AUDIO_CACHE, key=lambda k: AUDIO_CACHE[k]["t"])
-            del AUDIO_CACHE[oldest]
-        AUDIO_CACHE[audio_id] = {"audio": audio, "engine": engine, "t": now}
+    with JOBS_LOCK:
+        for key in [k for k, v in JOBS.items() if now - v["t"] > JOB_TTL_SECONDS]:
+            del JOBS[key]
+        while len(JOBS) >= JOB_MAX_ITEMS:
+            oldest = min(JOBS, key=lambda k: JOBS[k]["t"])
+            del JOBS[oldest]
+        JOBS[job_id] = {
+            "text": text,
+            "lang": lang,
+            "ls": length_scale,
+            "pf": pitch_factor,
+            "t": now,
+        }
+    return job_id
 
-    gc.collect()
-    return audio_id
+
+def job_get(job_id):
+    with JOBS_LOCK:
+        item = JOBS.get(job_id)
+        return dict(item) if item else None
 
 
-def cache_get(audio_id):
-    with AUDIO_CACHE_LOCK:
-        item = AUDIO_CACHE.get(audio_id)
-        return (item["audio"], item["engine"]) if item else None
+def _put_item(q, item, cancel):
+    """قطار بھری ہو تو انتظار کرو، مگر منسوخ ہو جائے تو فوراً نکل جاؤ۔"""
+    while not cancel.is_set():
+        try:
+            q.put(item, timeout=0.5)
+            return True
+        except queue.Full:
+            continue
+    return False
+
+
+def _piper_piece(piece, job, enc, key):
+    """ایک ٹکڑے کا MP3 بناؤ۔ SYNTH_LOCK صرف Piper کی synthesis کے دوران پکڑا جاتا ہے۔"""
+    with SYNTH_LOCK:
+        voice = get_voice(key)
+        if voice is None:
+            raise RuntimeError("Piper voice is not loaded")
+        wav = generate_piper_wav(piece, job["ls"], voice)
+    if not wav:
+        return b"", enc
+    pcm, sample_rate, channels = _wav_to_pcm(wav)
+    del wav
+    if not pcm:
+        return b"", enc
+    if abs(job["pf"] - 1.0) > 0.005:
+        pcm = shift_pitch_pcm(pcm, job["pf"])
+    if enc is None:
+        enc = _new_encoder(sample_rate, channels)
+    data = bytes(enc.encode(pcm))
+    del pcm
+    return data, enc
+
+
+def _producer(job, q, cancel):
+    """الگ تھریڈ: ٹکڑے بنا کر قطار میں ڈالتا ہے۔ نیٹ ورک سست ہو تب بھی اگلا ٹکڑا بنتا رہتا ہے،
+    اس لیے ٹکڑوں کے بیچ وقفہ نہیں آتا۔"""
+    key = "en" if job["lang"] == "en" else "ur"
+    enc = None
+    sent_any = False
+    t0 = time.time()
+    try:
+        pieces = split_for_stream(job["text"])
+        logger.info("STREAM start: %d pieces, lang=%s", len(pieces), key)
+        for n, piece in enumerate(pieces):
+            if cancel.is_set():
+                logger.info("STREAM cancelled")
+                return
+            try:
+                data, enc = _piper_piece(piece, job, enc, key)
+            except Exception:
+                logger.exception("PIPER piece failed")
+                if not sent_any:
+                    # پہلے ہی ٹکڑے پر ناکامی: پورے متن کے لیے گوگل بیک اپ
+                    try:
+                        mp3 = generate_google_mp3(job["text"], "en" if key == "en" else "ur")
+                        _put_item(q, mp3, cancel)
+                        logger.info("STREAM fallback to gTTS")
+                    except Exception:
+                        logger.exception("GOOGLE TTS FAILED")
+                    return
+                break   # بیچ میں ناکامی: جو بھیجا جا چکا وہ ٹھیک ہے، اسٹریم ختم
+            if data:
+                if not _put_item(q, data, cancel):
+                    return
+                if not sent_any:
+                    logger.info("STREAM first audio after %.2fs", time.time() - t0)
+                sent_any = True
+        if enc is not None:
+            tail = bytes(enc.flush())
+            if tail:
+                _put_item(q, tail, cancel)
+        logger.info("STREAM done in %.2fs", time.time() - t0)
+    except Exception:
+        logger.exception("STREAM producer crashed")
+    finally:
+        enc = None
+        if not cancel.is_set():
+            _put_item(q, None, cancel)
+        trim_memory()
 
 
 def synthesize(text, lang, length_scale, pitch_factor):
+    """(/voice کے لیے) غیر اسٹریمنگ، مکمل MP3۔"""
     audio = None
     engine = "google"
     is_en = (lang == "en")
 
-    # انگلش کے لیے Piper English Female (Amy)، باقی کے لیے Piper اردو
-    voice = piper_en if is_en else piper_voice
+    try:
+        with SYNTH_LOCK:
+            voice = get_voice("en" if is_en else "ur")
+            if voice is not None:
+                audio = generate_piper_mp3(text, length_scale, pitch_factor, voice)
+                engine = "piper-en-female" if is_en else "piper-mp3"
+            trim_memory()
+    except Exception:
+        audio = None
+        logger.exception("PIPER SYNTHESIS FAILED")
 
-    if voice is not None:
-        try:
-            with SYNTH_LOCK:
-                wav_data = generate_piper_wav(text, length_scale, voice)
-                audio = wav_to_mp3(wav_data, pitch_factor)
-                del wav_data
-            engine = "piper-en-female" if is_en else "piper-mp3"
-        except Exception:
-            logger.exception("PIPER SYNTHESIS FAILED")
-
-    # بیک اپ: گوگل
     if audio is None:
         try:
             audio = generate_google_mp3(text, "en" if is_en else "ur")
@@ -295,7 +552,6 @@ def synthesize(text, lang, length_scale, pitch_factor):
             logger.exception("GOOGLE TTS FAILED")
             raise
 
-    gc.collect()
     return audio, engine
 
 
@@ -322,10 +578,7 @@ def voice():
 
     try:
         audio, engine = synthesize(text, lang, length_scale, pitch_factor)
-        resp = mp3_response(audio, engine)
-        del audio
-        gc.collect()
-        return resp
+        return mp3_response(audio, engine)
     except Exception:
         logger.exception("ALL TTS ENGINES FAILED")
         return jsonify({"error": "TTS failed"}), 500
@@ -333,34 +586,57 @@ def voice():
 
 @app.route("/tts", methods=["POST"])
 def tts():
+    """فوراً لوٹتا ہے: متن محفوظ کر کے آئی ڈی دیتا ہے۔"""
     text = request.get_data(as_text=True).strip()
     lang = request.args.get("lang", "ur").strip().lower()
     rate_pct, pitch_hz, length_scale, pitch_factor = voice_params()
 
-    if not text or len(text) > 3000:
+    if not text or len(text) > MAX_TEXT_CHARS:
         return Response("", status=400, mimetype="text/plain")
 
-    try:
-        audio, engine = synthesize(text, lang, length_scale, pitch_factor)
-    except Exception:
-        logger.exception("ALL TTS ENGINES FAILED")
-        return Response("", status=500, mimetype="text/plain")
-
-    audio_id = cache_put(audio, engine)
-    del audio
-    gc.collect()
-    return Response(audio_id, status=200, mimetype="text/plain")
+    job_id = job_put(text, lang, length_scale, pitch_factor)
+    return Response(job_id, status=200, mimetype="text/plain")
 
 
 @app.route("/audio/<audio_id>.mp3", methods=["GET"])
 def audio_file(audio_id):
-    found = cache_get(audio_id)
-    if not found:
+    """آڈیو بنتے ہی ٹکڑا بہ ٹکڑا بھیجتا ہے (chunked streaming)۔"""
+    global ACTIVE_CANCEL
+    job = job_get(audio_id)
+    if not job:
         return Response("Audio expired or not found", status=404, mimetype="text/plain")
-    audio, engine = found
-    resp = mp3_response(audio, engine)
-    gc.collect()
-    return resp
+
+    cancel = threading.Event()
+    with ACTIVE_LOCK:
+        if ACTIVE_CANCEL is not None:
+            ACTIVE_CANCEL.set()      # پرانی اسٹریم بند: CPU نئی درخواست کو ملے
+        ACTIVE_CANCEL = cancel
+
+    q = queue.Queue(maxsize=STREAM_QUEUE_MAX)
+    threading.Thread(target=_producer, args=(job, q, cancel), daemon=True).start()
+
+    def generate():
+        try:
+            while True:
+                try:
+                    item = q.get(timeout=STREAM_IDLE_TIMEOUT)
+                except queue.Empty:
+                    break
+                if item is None:
+                    break
+                yield item
+        finally:
+            cancel.set()             # کلائنٹ چلا گیا یا ختم: پروڈیوسر رک جائے
+
+    return Response(
+        generate(),
+        mimetype="audio/mpeg",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Accel-Buffering": "no",
+            "X-Luma-TTS": "piper-stream",
+        },
+    )
 
 
 def pcm_to_wav(pcm, sample_rate=16000):
@@ -377,12 +653,8 @@ def pcm_to_wav(pcm, sample_rate=16000):
 
 # ─────────────────────────────────────────────
 # 🔹 STT (Groq Whisper)
-#    lang = "en"  → صرف انگلش
-#    lang = "ur"  → صرف اردو
-#    lang = ""    → آٹو: Whisper خود زبان پہچانتا ہے۔
-#                   اگر انگلش نہ ہو تو اردو کے ساتھ دوبارہ
-#                   چلایا جاتا ہے تاکہ اردو رسم الخط ہی ملے
-#                   (ورنہ Whisper اردو کو ہندی میں لکھ دیتا ہے)۔
+#    lang = "en" → صرف انگلش | "ur" → صرف اردو | "" → آٹو
+#    آٹو میں انگلش نہ ہو تو اردو کے ساتھ دوبارہ، تاکہ اردو رسم الخط ملے۔
 # ─────────────────────────────────────────────
 def _groq_request(wav_bytes, lang, verbose):
     """Groq Whisper کو ایک کال۔ (text, detected_language) لوٹاتا ہے۔"""
@@ -454,7 +726,6 @@ def _send_to_groq_stt(pcm, lang=""):
             text, _ = _groq_request(wav_bytes, "ur", False)
 
     del wav_bytes
-    gc.collect()
     return text
 
 
@@ -472,26 +743,20 @@ def stt():
     try:
         text = _send_to_groq_stt(pcm, lang=lang)
         del pcm
-        gc.collect()
         return Response(text, status=200, mimetype="text/plain; charset=utf-8")
     except Exception:
         logger.exception("STT FAILED")
-        gc.collect()
 
     return Response("", status=500, mimetype="text/plain")
 
 
 # ─────────────────────────────────────────────
-# 🔹 نیا اسٹریمنگ STT (start / chunk / end)
-#    ریکارڈنگ کے دوران چھوٹے چھوٹے ٹکڑے
-#    سرور پر جمع ہوتے ہیں، پھر ایک ساتھ
-#    Whisper پر بھیجے جاتے ہیں۔ ESP32 پر
-#    کبھی بڑا بفر نہیں بنتا → میموری محفوظ۔
+# 🔹 اسٹریمنگ STT (start / chunk / end)
 # ─────────────────────────────────────────────
 STT_SESSIONS = {}
 STT_SESSIONS_LOCK = threading.Lock()
 STT_SESSION_TTL = 60
-STT_MAX_CHUNKS = 500  # ~500 * 4KB ≈ 2MB (کافی زیادہ)
+STT_MAX_CHUNKS = 500  # ~500 * 4KB ≈ 2MB
 
 
 def cleanup_stt_sessions():
@@ -557,30 +822,26 @@ def stt_end():
     pcm = b"".join(session["chunks"])
     total_chunks = len(session["chunks"])
     del session
-    gc.collect()
 
     logger.info("STT end: id=%s chunks=%d bytes=%d", session_id, total_chunks, len(pcm))
 
     if len(pcm) < 3200:
         del pcm
-        gc.collect()
         return Response("", status=200, mimetype="text/plain")
 
     try:
         text = _send_to_groq_stt(pcm, lang=lang)
         del pcm
-        gc.collect()
         logger.info("STT end → text: %s", text[:80])
         return Response(text, status=200, mimetype="text/plain; charset=utf-8")
     except Exception:
         logger.exception("STT END FAILED")
-        gc.collect()
         return Response("", status=500, mimetype="text/plain")
 
 
-# Load the model before accepting requests.
+# Urdu ماڈل ریکوئسٹس سے پہلے لوڈ (انگلش پہلی انگلش درخواست پر)۔
 load_piper()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, threaded=True)
