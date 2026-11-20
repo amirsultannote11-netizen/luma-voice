@@ -4,6 +4,7 @@ import re
 import time
 import json
 import queue
+import hashlib
 import threading
 import wave
 import uuid
@@ -598,35 +599,141 @@ def tts():
     return Response(job_id, status=200, mimetype="text/plain")
 
 
-def _full_response(job):
-    """وہی ٹکڑے بناتا ہے مگر سب جمع کر کے ایک ہی جواب میں دیتا ہے (Content-Length کے ساتھ)۔"""
+def _build_full_audio(job, register=True, cancel=None):
+    """پورا متن بنا کر ایک ہی MP3 (bytes) لوٹاتا ہے۔ register=True ہو تو پچھلی چلتی ہوئی جنریشن بند کر دیتا ہے۔"""
     global ACTIVE_CANCEL
-    cancel = threading.Event()
-    with ACTIVE_LOCK:
-        if ACTIVE_CANCEL is not None:
-            ACTIVE_CANCEL.set()
-        ACTIVE_CANCEL = cancel
+    if cancel is None:
+        cancel = threading.Event()
+    if register:
+        with ACTIVE_LOCK:
+            if ACTIVE_CANCEL is not None:
+                ACTIVE_CANCEL.set()
+            ACTIVE_CANCEL = cancel
 
     q = queue.Queue(maxsize=STREAM_QUEUE_MAX)
-    threading.Thread(target=_producer, args=(job, q, cancel), daemon=True).start()
+    th = threading.Thread(target=_producer, args=(job, q, cancel), daemon=True)
+    th.start()
     parts = []
+    last = time.time()
     try:
         while True:
             try:
-                item = q.get(timeout=STREAM_IDLE_TIMEOUT)
+                item = q.get(timeout=1.0)
             except queue.Empty:
-                break
+                if cancel.is_set() or not th.is_alive():
+                    break
+                if time.time() - last > STREAM_IDLE_TIMEOUT:
+                    break
+                continue
+            last = time.time()
             if item is None:
                 break
             parts.append(item)
     finally:
         cancel.set()
-
     audio = b"".join(parts)
     del parts
+    return audio
+
+
+def _full_response(job):
+    audio = _build_full_audio(job)
     if not audio:
         return Response("TTS failed", status=500, mimetype="text/plain")
     return mp3_response(audio, "piper-full")
+
+
+# ─────────────────────────────────────────────
+# اگلے جملے کی پیشگی تیاری (/speak)
+# ESP32 موجودہ جملے کے ساتھ اگلے جملے کا متن بھی بھیجتا ہے۔ موجودہ جملہ تیار ہوتے ہی سرور اگلا
+# پس منظر میں بنانا شروع کر دیتا ہے، تاکہ جب ESP32 اگلا مانگے تو وہ پہلے سے تیار ملے۔
+# پیشگی تیاری موجودہ جملے کے بعد شروع ہوتی ہے، اس لیے پہلی آواز کو سست نہیں کرتی۔
+# ─────────────────────────────────────────────
+PRE = {}
+PRE_LOCK = threading.Lock()
+PRE_MAX = 2
+PRE_TTL = 180
+
+
+def _pre_key(text, lang, ls, pf):
+    raw = "%s|%s|%.4f|%.4f" % (lang, text, ls, pf)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def _pre_start(text, lang, ls, pf):
+    key = _pre_key(text, lang, ls, pf)
+    now = time.time()
+    with PRE_LOCK:
+        for k in [k for k, v in PRE.items() if now - v["t"] > PRE_TTL]:
+            PRE[k]["cancel"].set()
+            del PRE[k]
+        if key in PRE:
+            return
+        while len(PRE) >= PRE_MAX:
+            oldest = min(PRE, key=lambda k: PRE[k]["t"])
+            PRE[oldest]["cancel"].set()
+            del PRE[oldest]
+        entry = {"event": threading.Event(), "audio": None, "t": now, "cancel": threading.Event()}
+        PRE[key] = entry
+
+    def run():
+        try:
+            entry["audio"] = _build_full_audio(
+                {"text": text, "lang": lang, "ls": ls, "pf": pf},
+                register=False, cancel=entry["cancel"])
+            logger.info("PRE ready: %d bytes", len(entry["audio"] or b""))
+        except Exception:
+            logger.exception("PRE generation failed")
+        finally:
+            entry["event"].set()
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+def _get_full_audio(job):
+    key = _pre_key(job["text"], job["lang"], job["ls"], job["pf"])
+    entry = None
+    with PRE_LOCK:
+        entry = PRE.pop(key, None)
+        # نیا سوال: باقی پرانی پیشگی تیاریاں بند، CPU نئی درخواست کو ملے
+        for k in list(PRE.keys()):
+            PRE[k]["cancel"].set()
+            del PRE[k]
+
+    audio = None
+    if entry is not None:
+        entry["event"].wait(timeout=90)
+        audio = entry["audio"]
+        if audio:
+            logger.info("PRE hit: served prepared audio (%d bytes)", len(audio))
+    if not audio:
+        audio = _build_full_audio(job)
+
+    nxt = job.get("next", "")
+    if audio and nxt:
+        _pre_start(nxt, job["lang"], job["ls"], job["pf"])
+    return audio
+
+
+@app.route("/speak", methods=["POST"])
+def speak():
+    """ایک ہی درخواست میں متن بھیجو اور اسی جواب میں پوری MP3 (Content-Length کے ساتھ) واپس لو۔
+    باڈی: 'موجودہ جملہ' یا 'موجودہ جملہ\x1eاگلا جملہ'۔"""
+    body = request.get_data(as_text=True)
+    text, _, nxt = body.partition("\x1e")
+    text = text.strip()
+    nxt = nxt.strip()[:MAX_TEXT_CHARS]
+    lang = request.args.get("lang", "ur").strip().lower()
+    rate_pct, pitch_hz, length_scale, pitch_factor = voice_params()
+
+    if not text or len(text) > MAX_TEXT_CHARS:
+        return Response("", status=400, mimetype="text/plain")
+
+    job = {"text": text, "lang": lang, "ls": length_scale, "pf": pitch_factor, "next": nxt}
+    audio = _get_full_audio(job)
+    if not audio:
+        return Response("TTS failed", status=500, mimetype="text/plain")
+    return mp3_response(audio, "piper-speak")
 
 
 @app.route("/audio/<audio_id>.mp3", methods=["GET"])
